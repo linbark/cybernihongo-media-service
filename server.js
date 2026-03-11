@@ -1,0 +1,591 @@
+import express from 'express';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { createMediaStore } from './mediaStore.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const app = express();
+
+const HOST = process.env.HOST || '0.0.0.0';
+const PORT = Number(process.env.PORT || 8786);
+const SERVICE_NAME = 'cybernihongo-media-service';
+const VERSION = 1;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, '') || '';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim() || '';
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN?.trim() || '';
+const MEDIA_DB_DRIVER = process.env.MEDIA_DB_DRIVER?.trim() || process.env.CATALOG_DB_DRIVER?.trim() || '';
+const MEDIA_DB_FILE = process.env.MEDIA_DB_FILE?.trim() || process.env.CATALOG_DB_FILE?.trim() || path.join(__dirname, 'data', 'media.db');
+const MEDIA_DATABASE_URL = process.env.MEDIA_DATABASE_URL?.trim() || process.env.CATALOG_DATABASE_URL?.trim() || process.env.DATABASE_URL?.trim() || '';
+const MEDIA_STORAGE_PROVIDER = process.env.MEDIA_STORAGE_PROVIDER?.trim() || 'cos';
+const MEDIA_UPLOAD_MODE = process.env.MEDIA_UPLOAD_MODE?.trim() || 'direct';
+const MEDIA_BUCKET = process.env.MEDIA_BUCKET?.trim() || '';
+const MEDIA_UPLOAD_KEY_PREFIX = process.env.MEDIA_UPLOAD_KEY_PREFIX?.trim().replace(/^\/+|\/+$/g, '') || 'uploads';
+const MEDIA_UPLOAD_SESSION_TTL_SEC = Math.max(60, Number(process.env.MEDIA_UPLOAD_SESSION_TTL_SEC || 1800));
+const MEDIA_ASSET_PUBLIC_BASE_URL = process.env.MEDIA_ASSET_PUBLIC_BASE_URL?.trim().replace(/\/$/, '') || '';
+const TCB_ENV_ID = process.env.TCB_ENV_ID?.trim() || process.env.CLOUDBASE_ENV_ID?.trim() || '';
+
+const mediaStore = await createMediaStore({
+  driver: MEDIA_DB_DRIVER,
+  dbFilePath: MEDIA_DB_FILE,
+  databaseUrl: MEDIA_DATABASE_URL,
+});
+const MEDIA_BACKEND = mediaStore.driver;
+
+const jsonParser = express.json({ limit: '2mb' });
+
+const normalizeString = (value, fallback = '') => (typeof value === 'string' ? value.trim() : fallback);
+const coerceBoolean = (value, fallback = false) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on', 'y'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off', 'n'].includes(normalized)) return false;
+  }
+  return fallback;
+};
+const coerceNumber = (value, fallback) => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+};
+const coerceTags = (value, fallback = []) => {
+  if (Array.isArray(value)) {
+    return Array.from(new Set(value.map((item) => normalizeString(item)).filter(Boolean)));
+  }
+  if (typeof value === 'string') {
+    return Array.from(new Set(value.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean)));
+  }
+  return fallback;
+};
+const slugify = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+const sanitizeFileName = (value) =>
+  String(value || '')
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '');
+const isObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+
+const getBaseUrl = (req) => PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
+const createHttpError = (status, message) => {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+};
+const withErrorHandling = (handler) => async (req, res, next) => {
+  try {
+    await handler(req, res, next);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const requireAdmin = (req, res, next) => {
+  if (!ADMIN_TOKEN) {
+    next();
+    return;
+  }
+  const token = req.header('x-admin-token') || String(req.query.token || '').trim();
+  if (token === ADMIN_TOKEN) {
+    next();
+    return;
+  }
+  res.status(401).json({ message: 'Unauthorized admin request.' });
+};
+
+const requireInternal = (req, res, next) => {
+  const accepted = [INTERNAL_TOKEN, ADMIN_TOKEN].filter(Boolean);
+  if (accepted.length === 0) {
+    next();
+    return;
+  }
+  const token = req.header('x-internal-token') || req.header('x-admin-token') || String(req.query.token || '').trim();
+  if (accepted.includes(token)) {
+    next();
+    return;
+  }
+  res.status(401).json({ message: 'Unauthorized internal request.' });
+};
+
+const buildCloudFileId = ({ bucket = '', objectKey = '' }) => {
+  if (!bucket || !objectKey || !TCB_ENV_ID) return '';
+  return `cloud://${TCB_ENV_ID}.${bucket}/${objectKey}`;
+};
+
+const buildPublicAssetUrl = (objectKey) => {
+  if (!MEDIA_ASSET_PUBLIC_BASE_URL || !objectKey) return '';
+  try {
+    return new URL(objectKey, `${MEDIA_ASSET_PUBLIC_BASE_URL}/`).toString();
+  } catch {
+    return `${MEDIA_ASSET_PUBLIC_BASE_URL}/${objectKey}`;
+  }
+};
+
+const buildObjectKey = ({ fileName = '' }) => {
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '/');
+  const safeName = sanitizeFileName(fileName || 'media.bin') || 'media.bin';
+  return `${MEDIA_UPLOAD_KEY_PREFIX}/${today}/${randomUUID()}-${safeName}`;
+};
+
+const normalizeVideoPayload = (payload, existing = null) => {
+  const resolvedId = slugify(payload.id || existing?.id || payload.title || 'video');
+  if (!resolvedId) {
+    throw createHttpError(400, 'Video id is required.');
+  }
+
+  return {
+    id: resolvedId,
+    title: normalizeString(payload.title, existing?.title || resolvedId),
+    description: normalizeString(payload.description, existing?.description || ''),
+    provider: normalizeString(payload.provider, existing?.provider || SERVICE_NAME),
+    language: normalizeString(payload.language, existing?.language || 'ja-JP'),
+    level: normalizeString(payload.level, existing?.level || ''),
+    tags: coerceTags(payload.tags, existing?.tags || []),
+    status: normalizeString(payload.status, existing?.status || 'active'),
+    publishedAt: normalizeString(payload.publishedAt || payload.published_at, existing?.publishedAt || new Date().toISOString()),
+    coverAssetId: normalizeString(payload.coverAssetId || payload.cover_asset_id, existing?.coverAssetId || ''),
+    sourceAssetId: normalizeString(payload.sourceAssetId || payload.source_asset_id, existing?.sourceAssetId || ''),
+    subtitleAssetId: normalizeString(payload.subtitleAssetId || payload.subtitle_asset_id, existing?.subtitleAssetId || ''),
+    mediaType: normalizeString(payload.mediaType || payload.media_type, existing?.mediaType || 'video') === 'audio' ? 'audio' : 'video',
+    mediaFile: normalizeString(payload.mediaFile || payload.media_file, existing?.mediaFile || ''),
+    thumbnailFile: normalizeString(payload.thumbnailFile || payload.thumbnail_file, existing?.thumbnailFile || ''),
+    subtitleDocumentFile: normalizeString(payload.subtitleDocumentFile || payload.subtitle_document_file, existing?.subtitleDocumentFile || ''),
+    mediaUrl: normalizeString(payload.mediaUrl || payload.media_url, existing?.mediaUrl || ''),
+    downloadUrl: normalizeString(payload.downloadUrl || payload.download_url, existing?.downloadUrl || ''),
+    thumbnailUrl: normalizeString(payload.thumbnailUrl || payload.thumbnail_url, existing?.thumbnailUrl || ''),
+    subtitleDocumentUrl: normalizeString(payload.subtitleDocumentUrl || payload.subtitle_document_url, existing?.subtitleDocumentUrl || ''),
+    referenceText: normalizeString(payload.referenceText || payload.reference_text, existing?.referenceText || ''),
+    hasRefinedSubtitles: coerceBoolean(payload.hasRefinedSubtitles ?? payload.has_refined_subtitles, existing?.hasRefinedSubtitles || false),
+    hasTranslation: coerceBoolean(payload.hasTranslation ?? payload.has_translation, existing?.hasTranslation || false),
+    createdAt: existing?.createdAt,
+    updatedAt: existing?.updatedAt,
+  };
+};
+
+const buildPublicCatalogItem = async (req, item) => {
+  const sourceAsset = item.sourceAssetId ? await mediaStore.getMediaAssetById(item.sourceAssetId) : null;
+  const subtitleAsset = item.subtitleAssetId ? await mediaStore.getMediaAssetById(item.subtitleAssetId) : null;
+
+  const sourceObjectUrl = sourceAsset?.objectKey ? buildPublicAssetUrl(sourceAsset.objectKey) : '';
+  const subtitleObjectUrl = subtitleAsset?.objectKey ? buildPublicAssetUrl(subtitleAsset.objectKey) : '';
+
+  const mediaUrl = normalizeString(item.mediaUrl) || sourceObjectUrl;
+  const downloadUrl = normalizeString(item.downloadUrl) || mediaUrl;
+  const subtitleDocumentUrl = normalizeString(item.subtitleDocumentUrl) || subtitleObjectUrl;
+
+  return {
+    id: item.id,
+    title: item.title,
+    description: item.description,
+    provider: item.provider,
+    language: item.language,
+    level: item.level,
+    tags: item.tags || [],
+    status: item.status || 'active',
+    published_at: item.publishedAt,
+    media_type: item.mediaType || 'video',
+    media_url: mediaUrl,
+    download_url: downloadUrl,
+    thumbnail_url: normalizeString(item.thumbnailUrl),
+    subtitle_document_url: subtitleDocumentUrl,
+    reference_text: item.referenceText || '',
+    has_refined_subtitles: Boolean(item.hasRefinedSubtitles),
+    has_translation: Boolean(item.hasTranslation),
+    source_asset_id: item.sourceAssetId || '',
+    subtitle_asset_id: item.subtitleAssetId || '',
+    links: {
+      self: `${getBaseUrl(req)}/videos/${encodeURIComponent(item.id)}`,
+      admin: `${getBaseUrl(req)}/admin/videos/${encodeURIComponent(item.id)}`,
+    },
+  };
+};
+
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,PUT,PATCH');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Token, X-Internal-Token');
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
+app.get('/', (_req, res) => {
+  res.json({
+    service: SERVICE_NAME,
+    version: VERSION,
+    docs: {
+      health: '/health',
+      listVideos: '/videos',
+      createUploadSession: '/upload-sessions',
+      confirmUploadSession: '/upload-sessions/:id/confirm',
+    },
+  });
+});
+
+app.get('/health', withErrorHandling(async (_req, res) => {
+  let healthy = true;
+  let errorMessage = '';
+  let videoCount = null;
+
+  try {
+    await mediaStore.ping();
+    videoCount = await mediaStore.countVideos();
+  } catch (error) {
+    healthy = false;
+    errorMessage = error instanceof Error ? error.message : String(error);
+  }
+
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'ok' : 'degraded',
+    service: SERVICE_NAME,
+    version: VERSION,
+    mediaBackend: MEDIA_BACKEND,
+    mediaConnection: mediaStore.connectionSummary,
+    storage: {
+      provider: MEDIA_STORAGE_PROVIDER,
+      mode: MEDIA_UPLOAD_MODE,
+      bucket: MEDIA_BUCKET || undefined,
+      publicBaseUrl: MEDIA_ASSET_PUBLIC_BASE_URL || undefined,
+      envId: TCB_ENV_ID || undefined,
+    },
+    videos: {
+      count: videoCount,
+    },
+    adminProtected: Boolean(ADMIN_TOKEN),
+    internalProtected: Boolean(INTERNAL_TOKEN || ADMIN_TOKEN),
+    error: healthy ? undefined : errorMessage,
+    now: new Date().toISOString(),
+  });
+}));
+
+app.get(['/videos', '/api/videos', '/catalog', '/api/catalog'], withErrorHandling(async (req, res) => {
+  const filters = {
+    status: normalizeString(req.query.status),
+    limit: Math.max(1, Math.min(500, Math.round(coerceNumber(req.query.limit, 100)))),
+    offset: Math.max(0, Math.round(coerceNumber(req.query.offset, 0))),
+  };
+
+  const [items, total] = await Promise.all([
+    mediaStore.listVideos(filters),
+    mediaStore.countVideos({ status: filters.status }),
+  ]);
+  const publicItems = await Promise.all(items.map((item) => buildPublicCatalogItem(req, item)));
+
+  res.json({
+    service: SERVICE_NAME,
+    version: VERSION,
+    generated_at: new Date().toISOString(),
+    media_backend: MEDIA_BACKEND,
+    total,
+    limit: filters.limit,
+    offset: filters.offset,
+    items: publicItems,
+  });
+}));
+
+app.get(['/videos/:id', '/api/videos/:id'], withErrorHandling(async (req, res) => {
+  const video = await mediaStore.getVideoById(req.params.id);
+  if (!video) {
+    throw createHttpError(404, 'Video not found.');
+  }
+  res.json(await buildPublicCatalogItem(req, video));
+}));
+
+app.get('/admin/videos', requireAdmin, withErrorHandling(async (req, res) => {
+  const items = await mediaStore.listVideos({
+    status: normalizeString(req.query.status),
+    limit: Math.max(1, Math.min(500, Math.round(coerceNumber(req.query.limit, 100)))),
+    offset: Math.max(0, Math.round(coerceNumber(req.query.offset, 0))),
+  });
+  const result = await Promise.all(items.map((item) => buildPublicCatalogItem(req, item)));
+  res.json({
+    items: result,
+    service: SERVICE_NAME,
+    version: VERSION,
+    mediaBackend: MEDIA_BACKEND,
+  });
+}));
+
+app.get('/admin/videos/:id', requireAdmin, withErrorHandling(async (req, res) => {
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+  res.json(await buildPublicCatalogItem(req, item));
+}));
+
+app.post('/admin/videos', requireAdmin, jsonParser, withErrorHandling(async (req, res) => {
+  if (!isObject(req.body)) {
+    throw createHttpError(400, 'Invalid video payload.');
+  }
+  const next = normalizeVideoPayload(req.body);
+  if (await mediaStore.getVideoById(next.id)) {
+    throw createHttpError(409, `Video ${next.id} already exists.`);
+  }
+  const created = await mediaStore.createVideo(next);
+  res.status(201).json(await buildPublicCatalogItem(req, created));
+}));
+
+app.put('/admin/videos/:id', requireAdmin, jsonParser, withErrorHandling(async (req, res) => {
+  if (!isObject(req.body)) {
+    throw createHttpError(400, 'Invalid video payload.');
+  }
+  const current = await mediaStore.getVideoById(req.params.id);
+  if (!current) {
+    throw createHttpError(404, 'Video not found.');
+  }
+  const normalized = normalizeVideoPayload(req.body, current);
+  if (normalized.id !== current.id) {
+    throw createHttpError(400, 'Changing existing video id is not supported.');
+  }
+  const updated = await mediaStore.updateVideo(current.id, normalized);
+  res.json(await buildPublicCatalogItem(req, updated));
+}));
+
+app.post(['/upload-sessions', '/api/upload-sessions'], jsonParser, withErrorHandling(async (req, res) => {
+  if (!isObject(req.body)) {
+    throw createHttpError(400, 'Invalid upload session payload.');
+  }
+
+  const fileName = normalizeString(req.body.fileName || req.body.file_name, 'media.bin');
+  const bucket = normalizeString(req.body.bucket, MEDIA_BUCKET);
+  const objectKey = normalizeString(req.body.objectKey || req.body.object_key) || buildObjectKey({ fileName });
+  const now = Date.now();
+  const expiresAt = new Date(now + MEDIA_UPLOAD_SESSION_TTL_SEC * 1000).toISOString();
+
+  const uploadSession = await mediaStore.createUploadSession({
+    id: randomUUID(),
+    userId: normalizeString(req.body.userId || req.body.user_id),
+    purpose: normalizeString(req.body.purpose, 'video_source'),
+    mediaType: normalizeString(req.body.mediaType || req.body.media_type, 'video'),
+    fileName,
+    mimeType: normalizeString(req.body.mimeType || req.body.mime_type),
+    sizeBytes: coerceNumber(req.body.sizeBytes ?? req.body.size_bytes, null),
+    bucket,
+    objectKey,
+    status: 'issued',
+    assetId: '',
+    expiresAt,
+  });
+
+  const fileId = buildCloudFileId({ bucket, objectKey });
+  res.status(201).json({
+    ok: true,
+    upload_session: uploadSession,
+    upload: {
+      provider: MEDIA_STORAGE_PROVIDER,
+      mode: MEDIA_UPLOAD_MODE,
+      bucket: bucket || undefined,
+      object_key: objectKey,
+      file_id: fileId || undefined,
+      expires_at: expiresAt,
+      confirm_url: `${getBaseUrl(req)}/upload-sessions/${encodeURIComponent(uploadSession.id)}/confirm`,
+      note: 'This baseline endpoint issues backend-controlled object keys. For COS direct upload, let client upload with short-lived credentials, then call confirm.',
+    },
+  });
+}));
+
+app.post(['/upload-sessions/:id/confirm', '/api/upload-sessions/:id/confirm'], jsonParser, withErrorHandling(async (req, res) => {
+  if (!isObject(req.body)) {
+    throw createHttpError(400, 'Invalid upload confirm payload.');
+  }
+
+  const session = await mediaStore.getUploadSessionById(req.params.id);
+  if (!session) {
+    throw createHttpError(404, 'Upload session not found.');
+  }
+  if (!['issued', 'confirmed'].includes(session.status)) {
+    throw createHttpError(409, `Upload session status ${session.status} cannot be confirmed.`);
+  }
+  if (session.expiresAt && Date.now() > Date.parse(session.expiresAt)) {
+    await mediaStore.updateUploadSession(session.id, { status: 'expired' });
+    throw createHttpError(410, 'Upload session has expired.');
+  }
+
+  const bucket = normalizeString(req.body.bucket, session.bucket || MEDIA_BUCKET);
+  const objectKey = normalizeString(req.body.objectKey || req.body.object_key, session.objectKey);
+  const fileName = normalizeString(req.body.fileName || req.body.file_name, session.fileName);
+  if (!objectKey) {
+    throw createHttpError(400, 'objectKey is required to confirm upload.');
+  }
+
+  let asset = await mediaStore.findMediaAssetByObjectKey(bucket, objectKey);
+  if (!asset) {
+    const fileId = normalizeString(req.body.fileId || req.body.file_id) || buildCloudFileId({ bucket, objectKey });
+    asset = await mediaStore.createMediaAsset({
+      id: randomUUID(),
+      userId: normalizeString(req.body.userId || req.body.user_id, session.userId),
+      purpose: normalizeString(req.body.purpose, session.purpose),
+      mediaType: normalizeString(req.body.mediaType || req.body.media_type, session.mediaType),
+      fileName,
+      mimeType: normalizeString(req.body.mimeType || req.body.mime_type, session.mimeType),
+      sizeBytes: coerceNumber(req.body.sizeBytes ?? req.body.size_bytes, session.sizeBytes),
+      bucket,
+      objectKey,
+      fileId,
+      checksum: normalizeString(req.body.checksum),
+      status: 'ready',
+      source: 'upload_session',
+    });
+  }
+
+  const updatedSession = await mediaStore.updateUploadSession(session.id, {
+    status: 'confirmed',
+    assetId: asset.id,
+    bucket,
+    objectKey,
+    mimeType: normalizeString(req.body.mimeType || req.body.mime_type, session.mimeType),
+    sizeBytes: coerceNumber(req.body.sizeBytes ?? req.body.size_bytes, session.sizeBytes),
+  });
+
+  let video = null;
+  const createVideo = coerceBoolean(req.body.createVideo ?? req.body.create_video, session.purpose === 'video_source');
+  if (createVideo) {
+    const explicitVideoId = normalizeString(req.body.videoId || req.body.video_id || req.body.video?.id);
+    const fallbackVideoName = path.parse(fileName || objectKey).name || 'video';
+    const videoId = slugify(explicitVideoId || fallbackVideoName) || randomUUID();
+    const existing = await mediaStore.getVideoById(videoId);
+
+    if (existing) {
+      video = await mediaStore.updateVideo(existing.id, {
+        sourceAssetId: asset.id,
+        mediaType: normalizeString(req.body.mediaType || req.body.media_type, existing.mediaType),
+        mediaUrl: normalizeString(req.body.mediaUrl || req.body.media_url, existing.mediaUrl),
+        downloadUrl: normalizeString(req.body.downloadUrl || req.body.download_url, existing.downloadUrl),
+      });
+    } else {
+      const normalizedVideo = normalizeVideoPayload(
+        {
+          ...(isObject(req.body.video) ? req.body.video : {}),
+          id: videoId,
+          title: normalizeString(req.body.title, path.parse(fileName).name || videoId),
+          mediaType: normalizeString(req.body.mediaType || req.body.media_type, 'video'),
+          sourceAssetId: asset.id,
+          mediaUrl: normalizeString(req.body.mediaUrl || req.body.media_url),
+          downloadUrl: normalizeString(req.body.downloadUrl || req.body.download_url),
+        },
+        null,
+      );
+      video = await mediaStore.createVideo(normalizedVideo);
+    }
+  }
+
+  res.json({
+    ok: true,
+    upload_session: updatedSession,
+    media_asset: asset,
+    video: video ? await buildPublicCatalogItem(req, video) : null,
+  });
+}));
+
+app.get('/internal/videos/:id/source', requireInternal, withErrorHandling(async (req, res) => {
+  const video = await mediaStore.getVideoById(req.params.id);
+  if (!video) {
+    throw createHttpError(404, 'Video not found.');
+  }
+  const sourceAsset = video.sourceAssetId ? await mediaStore.getMediaAssetById(video.sourceAssetId) : null;
+
+  const sourceUri =
+    normalizeString(video.mediaUrl) ||
+    normalizeString(video.downloadUrl) ||
+    normalizeString(sourceAsset?.fileId) ||
+    buildCloudFileId({ bucket: sourceAsset?.bucket || MEDIA_BUCKET, objectKey: sourceAsset?.objectKey || '' }) ||
+    buildPublicAssetUrl(sourceAsset?.objectKey || '') ||
+    normalizeString(sourceAsset?.objectKey);
+
+  if (!sourceUri) {
+    throw createHttpError(409, 'Video source is not ready.');
+  }
+
+  res.json({
+    video_id: video.id,
+    source_uri: sourceUri,
+    source_asset_id: sourceAsset?.id || '',
+    source_asset: sourceAsset || null,
+  });
+}));
+
+app.post('/internal/videos/:id/subtitle-asset', requireInternal, jsonParser, withErrorHandling(async (req, res) => {
+  if (!isObject(req.body)) {
+    throw createHttpError(400, 'Invalid subtitle asset payload.');
+  }
+  const current = await mediaStore.getVideoById(req.params.id);
+  if (!current) {
+    throw createHttpError(404, 'Video not found.');
+  }
+
+  let subtitleAsset = null;
+  const requestedAssetId = normalizeString(req.body.assetId || req.body.asset_id);
+  if (requestedAssetId) {
+    subtitleAsset = await mediaStore.getMediaAssetById(requestedAssetId);
+    if (!subtitleAsset) {
+      throw createHttpError(404, 'Subtitle asset not found.');
+    }
+  } else {
+    const bucket = normalizeString(req.body.bucket, MEDIA_BUCKET);
+    const objectKey = normalizeString(req.body.objectKey || req.body.object_key);
+    if (!objectKey) {
+      throw createHttpError(400, 'objectKey is required when assetId is not provided.');
+    }
+    subtitleAsset =
+      (await mediaStore.findMediaAssetByObjectKey(bucket, objectKey)) ||
+      (await mediaStore.createMediaAsset({
+        id: randomUUID(),
+        userId: normalizeString(req.body.userId || req.body.user_id),
+        purpose: 'subtitle_result',
+        mediaType: 'subtitle',
+        fileName: normalizeString(req.body.fileName || req.body.file_name, `${current.id}.json`),
+        mimeType: normalizeString(req.body.mimeType || req.body.mime_type, 'application/json'),
+        sizeBytes: coerceNumber(req.body.sizeBytes ?? req.body.size_bytes, null),
+        bucket,
+        objectKey,
+        fileId: normalizeString(req.body.fileId || req.body.file_id) || buildCloudFileId({ bucket, objectKey }),
+        checksum: normalizeString(req.body.checksum),
+        status: 'ready',
+        source: 'task_result',
+      }));
+  }
+
+  const updated = await mediaStore.updateVideo(current.id, {
+    subtitleAssetId: subtitleAsset.id,
+    subtitleDocumentUrl: normalizeString(req.body.subtitleDocumentUrl || req.body.subtitle_document_url, current.subtitleDocumentUrl),
+    hasRefinedSubtitles: coerceBoolean(
+      req.body.hasRefinedSubtitles ?? req.body.has_refined_subtitles,
+      current.hasRefinedSubtitles || true,
+    ),
+    hasTranslation: coerceBoolean(req.body.hasTranslation ?? req.body.has_translation, current.hasTranslation),
+    referenceText: normalizeString(req.body.referenceText || req.body.reference_text, current.referenceText),
+  });
+
+  res.json({
+    ok: true,
+    video: await buildPublicCatalogItem(req, updated),
+    subtitle_asset: subtitleAsset,
+  });
+}));
+
+app.use((error, _req, res, _next) => {
+  const status = Number(error?.status || error?.statusCode || 500);
+  const message = error instanceof Error ? error.message : 'Internal server error.';
+  if (status >= 500) {
+    console.error(error);
+  }
+  res.status(status).json({ message });
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`[${SERVICE_NAME}] listening on http://${HOST}:${PORT} backend=${MEDIA_BACKEND}`);
+});
