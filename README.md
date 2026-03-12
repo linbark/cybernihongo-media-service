@@ -55,7 +55,14 @@ Reason:
 - `MEDIA_BUCKET`, object storage bucket name
 - `MEDIA_UPLOAD_KEY_PREFIX`, default `uploads`
 - `MEDIA_UPLOAD_SESSION_TTL_SEC`, default `1800`
+- `MEDIA_DOWNLOAD_URL_TTL_SEC`, default `1800`
 - `MEDIA_ASSET_PUBLIC_BASE_URL`, optional CDN/COS public prefix
+- `MEDIA_UPLOAD_MODE`, `direct` or `presigned_put`
+- `MEDIA_COS_REGION`, COS region for presigned upload issuance
+- `MEDIA_COS_DOMAIN`, optional custom COS upload domain for signed URLs
+- `MEDIA_COS_PROTOCOL`, optional upload URL protocol, default `https`
+- `MEDIA_COS_SECRET_ID` / `MEDIA_COS_SECRET_KEY`, optional overrides for COS signing; defaults to `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY`
+- `MEDIA_COS_SESSION_TOKEN`, optional session token override; also accepts `TENCENTCLOUD_SESSION_TOKEN` / `TCB_SESSION_TOKEN`
 
 CloudBase RDB:
 
@@ -85,6 +92,14 @@ CloudBase RDB:
 - `POST /api/upload-sessions`
 - `POST /upload-sessions/:id/confirm`
 - `POST /api/upload-sessions/:id/confirm`
+
+When `MEDIA_UPLOAD_MODE=presigned_put`, `POST /upload-sessions` returns a one-time presigned COS `PUT` URL plus any required request headers. The client must upload to that URL first, then call the returned `confirm_url`.
+
+Important:
+
+- browser direct upload requires COS bucket CORS to allow your web origin
+- if the bucket or custom upload domain does not return the correct CORS headers for `OPTIONS` and `PUT`, browser upload will fail before `confirm`
+- private object download does not require public read if clients download through `media-service /media/:id/download`
 
 ## Admin APIs
 
@@ -157,3 +172,27 @@ curl http://127.0.0.1:8786/videos/demo-video/subtitle-document
 curl http://127.0.0.1:8786/media/demo-video/stream
 curl -X DELETE 'http://127.0.0.1:8786/admin/videos/demo-video?deleteFiles=1'
 ```
+
+Presigned upload example:
+
+```bash
+MEDIA_STORAGE_PROVIDER=cos \
+MEDIA_UPLOAD_MODE=presigned_put \
+MEDIA_BUCKET=test-1250000000 \
+MEDIA_COS_REGION=ap-shanghai \
+TENCENTCLOUD_SECRET_ID=xxxx \
+TENCENTCLOUD_SECRET_KEY=xxxx \
+node server.js
+
+curl -X POST http://127.0.0.1:8786/upload-sessions \
+  -H 'Content-Type: application/json' \
+  --data '{"fileName":"lesson.mp4","mimeType":"video/mp4","purpose":"video_source"}'
+```
+
+The response includes:
+
+- backend-controlled `object_key`
+- presigned `upload.url`
+- upload `method`
+- required `headers`
+- `confirm_url` to finalize asset registration

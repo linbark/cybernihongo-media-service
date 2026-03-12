@@ -3,8 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { createCosUploadSigner } from './cosUploadSigner.js';
 import { createMediaStore } from './mediaStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,7 +29,20 @@ const MEDIA_UPLOAD_MODE = process.env.MEDIA_UPLOAD_MODE?.trim() || 'direct';
 const MEDIA_BUCKET = process.env.MEDIA_BUCKET?.trim() || '';
 const MEDIA_UPLOAD_KEY_PREFIX = process.env.MEDIA_UPLOAD_KEY_PREFIX?.trim().replace(/^\/+|\/+$/g, '') || 'uploads';
 const MEDIA_UPLOAD_SESSION_TTL_SEC = Math.max(60, Number(process.env.MEDIA_UPLOAD_SESSION_TTL_SEC || 1800));
+const MEDIA_DOWNLOAD_URL_TTL_SEC = Math.max(60, Number(process.env.MEDIA_DOWNLOAD_URL_TTL_SEC || 1800));
 const MEDIA_ASSET_PUBLIC_BASE_URL = process.env.MEDIA_ASSET_PUBLIC_BASE_URL?.trim().replace(/\/$/, '') || '';
+const MEDIA_COS_REGION = process.env.MEDIA_COS_REGION?.trim()
+  || process.env.COS_REGION?.trim()
+  || process.env.TENCENTCLOUD_REGION?.trim()
+  || '';
+const MEDIA_COS_DOMAIN = process.env.MEDIA_COS_DOMAIN?.trim() || '';
+const MEDIA_COS_PROTOCOL = process.env.MEDIA_COS_PROTOCOL?.trim() || 'https';
+const MEDIA_COS_SECRET_ID = process.env.MEDIA_COS_SECRET_ID?.trim() || process.env.TENCENTCLOUD_SECRET_ID?.trim() || '';
+const MEDIA_COS_SECRET_KEY = process.env.MEDIA_COS_SECRET_KEY?.trim() || process.env.TENCENTCLOUD_SECRET_KEY?.trim() || '';
+const MEDIA_COS_SESSION_TOKEN = process.env.MEDIA_COS_SESSION_TOKEN?.trim()
+  || process.env.TENCENTCLOUD_SESSION_TOKEN?.trim()
+  || process.env.TCB_SESSION_TOKEN?.trim()
+  || '';
 const STORAGE_MODE = process.env.STORAGE_MODE?.trim() === 'external' ? 'external' : 'local';
 const EXTERNAL_MEDIA_BASE_URL = process.env.EXTERNAL_MEDIA_BASE_URL?.trim().replace(/\/$/, '') || '';
 const EXTERNAL_THUMBNAIL_BASE_URL = process.env.EXTERNAL_THUMBNAIL_BASE_URL?.trim().replace(/\/$/, '') || '';
@@ -55,6 +70,14 @@ const mediaStore = await createMediaStore({
   databaseUrl: MEDIA_DATABASE_URL,
 });
 const MEDIA_BACKEND = mediaStore.driver;
+const cosUploadSigner = createCosUploadSigner({
+  secretId: MEDIA_COS_SECRET_ID,
+  secretKey: MEDIA_COS_SECRET_KEY,
+  sessionToken: MEDIA_COS_SESSION_TOKEN,
+  region: MEDIA_COS_REGION,
+  protocol: MEDIA_COS_PROTOCOL,
+  domain: MEDIA_COS_DOMAIN,
+});
 
 const jsonParser = express.json({ limit: '2mb' });
 const rawMediaParser = express.raw({ type: '*/*', limit: `${MAX_MEDIA_UPLOAD_MB}mb` });
@@ -154,6 +177,61 @@ const withErrorHandling = (handler) => async (req, res, next) => {
 const buildCloudFileId = ({ bucket = '', objectKey = '' }) => {
   if (!bucket || !objectKey || !TCB_ENV_ID) return '';
   return `cloud://${TCB_ENV_ID}.${bucket}/${objectKey}`;
+};
+const buildUploadInstruction = async ({
+  bucket = '',
+  objectKey = '',
+  mimeType = '',
+  expiresAt = '',
+  sessionId = '',
+  req,
+}) => {
+  const confirmUrl = `${getBaseUrl(req)}/upload-sessions/${encodeURIComponent(sessionId)}/confirm`;
+  const fileId = buildCloudFileId({ bucket, objectKey });
+  const uploadBase = {
+    provider: MEDIA_STORAGE_PROVIDER,
+    mode: MEDIA_UPLOAD_MODE,
+    bucket: bucket || undefined,
+    object_key: objectKey,
+    file_id: fileId || undefined,
+    expires_at: expiresAt || undefined,
+    confirm_url: confirmUrl,
+  };
+
+  if (MEDIA_UPLOAD_MODE === 'presigned_put') {
+    if (MEDIA_STORAGE_PROVIDER !== 'cos') {
+      throw createHttpError(503, `MEDIA_UPLOAD_MODE=${MEDIA_UPLOAD_MODE} currently requires MEDIA_STORAGE_PROVIDER=cos.`);
+    }
+    if (!bucket) {
+      throw createHttpError(503, 'MEDIA_BUCKET is required for presigned COS uploads.');
+    }
+    if (!cosUploadSigner.configured) {
+      throw createHttpError(503, 'COS presigned upload is not configured. Set MEDIA_COS_REGION and COS credentials first.');
+    }
+
+    const expiresInSec = Math.max(
+      60,
+      expiresAt ? Math.round((Date.parse(expiresAt) - Date.now()) / 1000) : MEDIA_UPLOAD_SESSION_TTL_SEC,
+    );
+    const signedUpload = await cosUploadSigner.createPresignedPut({
+      bucket,
+      objectKey,
+      expiresInSec,
+      contentType: mimeType,
+    });
+    return {
+      ...uploadBase,
+      method: signedUpload.method,
+      url: signedUpload.url,
+      headers: signedUpload.headers,
+      note: 'Upload the object with the provided presigned PUT URL, then call confirm.',
+    };
+  }
+
+  return {
+    ...uploadBase,
+    note: 'This endpoint issues backend-controlled object keys. Upload the object, then call confirm.',
+  };
 };
 const buildPublicAssetUrl = (objectKey) => {
   if (!MEDIA_ASSET_PUBLIC_BASE_URL || !objectKey) return '';
@@ -319,6 +397,7 @@ const resolvePublishedAssetUrls = async (req, item) => {
     || buildExternalAssetUrl(EXTERNAL_MEDIA_BASE_URL, item.mediaFile, req);
   const downloadUrl = buildAbsoluteUrl(item.downloadUrl, req)
     || (localMediaPath ? `${baseUrl}/media/${encodeURIComponent(item.id)}/download` : '')
+    || (sourceAsset?.objectKey ? `${baseUrl}/media/${encodeURIComponent(item.id)}/download` : '')
     || mediaUrl
     || sourceObjectUrl
     || buildExternalAssetUrl(EXTERNAL_MEDIA_BASE_URL, item.mediaFile, req);
@@ -421,6 +500,7 @@ app.get('/admin/config', withErrorHandling(async (_req, res) => {
     mediaConnection: mediaStore.connectionSummary,
     mediaStorageProvider: MEDIA_STORAGE_PROVIDER,
     mediaUploadMode: MEDIA_UPLOAD_MODE,
+    cosUploadSigning: cosUploadSigner.summary,
     maxMediaUploadMb: MAX_MEDIA_UPLOAD_MB,
     maxSubtitleUploadMb: MAX_SUBTITLE_UPLOAD_MB,
     mediaBucket: MEDIA_BUCKET || undefined,
@@ -465,6 +545,7 @@ app.get('/health', withErrorHandling(async (_req, res) => {
       provider: MEDIA_STORAGE_PROVIDER,
       mode: MEDIA_UPLOAD_MODE,
       bucket: MEDIA_BUCKET || undefined,
+      cosUploadSigning: cosUploadSigner.summary,
       publicBaseUrl: MEDIA_ASSET_PUBLIC_BASE_URL || undefined,
       envId: TCB_ENV_ID || undefined,
     },
@@ -556,6 +637,33 @@ app.get('/media/:id/download', withErrorHandling(async (req, res) => {
   }
 
   const published = await resolvePublishedAssetUrls(req, item);
+  if (published.sourceAsset?.bucket && published.sourceAsset?.objectKey && cosUploadSigner.configured) {
+    const signedDownload = await cosUploadSigner.createPresignedGet({
+      bucket: published.sourceAsset.bucket,
+      objectKey: published.sourceAsset.objectKey,
+      expiresInSec: MEDIA_DOWNLOAD_URL_TTL_SEC,
+    });
+    const upstream = await fetch(signedDownload.url);
+    if (!upstream.ok) {
+      throw createHttpError(upstream.status || 502, `Upstream asset download failed (${upstream.status}).`);
+    }
+
+    const contentType = upstream.headers.get('content-type') || published.sourceAsset.mimeType || 'application/octet-stream';
+    const contentLength = upstream.headers.get('content-length');
+    const downloadName = sanitizeFileName(published.sourceAsset.fileName || item.mediaFile || `${item.id}.bin`) || `${item.id}.bin`;
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+    if (!upstream.body) {
+      res.status(204).end();
+      return;
+    }
+    Readable.fromWeb(upstream.body).pipe(res);
+    return;
+  }
+
   maybeRedirectToExternalAsset(req, res, published.downloadUrl || published.mediaUrl);
 }));
 
@@ -763,20 +871,18 @@ app.post(['/upload-sessions', '/api/upload-sessions'], jsonParser, withErrorHand
     expiresAt,
   });
 
-  const fileId = buildCloudFileId({ bucket, objectKey });
+  const upload = await buildUploadInstruction({
+    bucket,
+    objectKey,
+    mimeType: normalizeString(req.body.mimeType || req.body.mime_type),
+    expiresAt,
+    sessionId: uploadSession.id,
+    req,
+  });
   res.status(201).json({
     ok: true,
     upload_session: uploadSession,
-    upload: {
-      provider: MEDIA_STORAGE_PROVIDER,
-      mode: MEDIA_UPLOAD_MODE,
-      bucket: bucket || undefined,
-      object_key: objectKey,
-      file_id: fileId || undefined,
-      expires_at: expiresAt,
-      confirm_url: `${getBaseUrl(req)}/upload-sessions/${encodeURIComponent(uploadSession.id)}/confirm`,
-      note: 'This endpoint issues backend-controlled object keys. Upload the object, then call confirm.',
-    },
+    upload,
   });
 }));
 
