@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>media-service Admin</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #08111c;
+        --panel: rgba(12, 24, 39, 0.9);
+        --panel-2: rgba(20, 38, 61, 0.92);
+        --border: rgba(148, 163, 184, 0.22);
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: #38bdf8;
+        --accent-2: #f59e0b;
+        --danger: #ef4444;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(56, 189, 248, 0.16), transparent 30%),
+          radial-gradient(circle at top right, rgba(245, 158, 11, 0.15), transparent 24%),
+          linear-gradient(180deg, #020617, #08111c 36%, #0f172a 100%);
+      }
+      .page {
+        width: min(1440px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 24px 0 40px;
+      }
+      .hero, .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        box-shadow: 0 18px 48px rgba(2, 6, 23, 0.38);
+      }
+      .hero { padding: 22px 24px; margin-bottom: 18px; }
+      .hero h1 { margin: 0; font-size: 26px; }
+      .hero p { margin: 8px 0 0; line-height: 1.6; color: var(--muted); }
+      .layout { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px; }
+      .panel { padding: 18px; }
+      .panel h2 { margin: 0 0 12px; font-size: 16px; }
+      .row, .grid, .toolbar, .token-grid { display: grid; gap: 12px; }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 12px; }
+      .token-grid { grid-template-columns: minmax(0, 1fr) 120px 92px; }
+      label { display: block; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
+      input, textarea, select {
+        width: 100%;
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        background: rgba(8, 17, 28, 0.82);
+        color: var(--text);
+        padding: 10px 12px;
+        font: inherit;
+      }
+      textarea { min-height: 96px; resize: vertical; }
+      button {
+        appearance: none;
+        border: 0;
+        border-radius: 12px;
+        padding: 10px 14px;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+        color: #06111d;
+        background: linear-gradient(180deg, #7dd3fc, #38bdf8);
+      }
+      button.secondary { background: linear-gradient(180deg, #fde68a, #f59e0b); }
+      button.ghost { background: linear-gradient(180deg, #1e293b, #0f172a); color: var(--text); border: 1px solid var(--border); }
+      button.danger { background: linear-gradient(180deg, #fb7185, #e11d48); color: white; }
+      button:disabled { opacity: 0.55; cursor: not-allowed; }
+      .status {
+        padding: 10px 12px;
+        white-space: pre-wrap;
+        line-height: 1.6;
+        border-radius: 12px;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+      }
+      .list { display: grid; gap: 12px; margin-top: 14px; }
+      .card {
+        padding: 14px;
+        border-radius: 14px;
+        background: var(--panel-2);
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        cursor: pointer;
+      }
+      .card.active { border-color: rgba(56, 189, 248, 0.8); box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.18); }
+      .card h3 { margin: 0 0 8px; font-size: 15px; }
+      .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+      .chip {
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+      .upload-box {
+        border-radius: 14px;
+        border: 1px dashed rgba(148, 163, 184, 0.26);
+        background: rgba(2, 6, 23, 0.22);
+        padding: 12px;
+      }
+      .muted { color: var(--muted); }
+      .small { font-size: 12px; }
+      a { color: var(--accent); }
+      @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } }
+      @media (max-width: 640px) { .grid, .toolbar, .token-grid { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <section class="hero">
+        <h1>media-service Admin</h1>
+        <p>统一管理 `CyberNihongo` 的媒体目录、上传会话、本地调试文件和精修字幕。这里现在是唯一的视频目录后台入口，不再依赖 `cloud-video-service`。</p>
+      </section>
+
+      <div class="layout">
+        <section class="panel">
+          <h2>目录列表</h2>
+          <div id="service-status" class="status">正在加载...</div>
+          <div class="row">
+            <label for="admin-token">Admin Token</label>
+            <div class="token-grid">
+              <input id="admin-token" type="password" placeholder="如果服务配置了 ADMIN_TOKEN，请填这里" />
+              <button id="save-token-btn" class="ghost" type="button">保存</button>
+              <button id="clear-token-btn" class="ghost" type="button">清空</button>
+            </div>
+          </div>
+          <div class="toolbar">
+            <button id="refresh-btn" type="button">刷新列表</button>
+            <button id="new-btn" type="button" class="secondary">新建条目</button>
+          </div>
+          <div class="row">
+            <label for="search-input">搜索</label>
+            <input id="search-input" placeholder="标题 / 标签 / 难度 / 语言" />
+          </div>
+          <div id="video-list" class="list"></div>
+        </section>
+
+        <section class="panel">
+          <h2>元数据与文件管理</h2>
+          <div id="editor-status" class="status">选择左侧条目，或创建新条目。</div>
+          <form id="meta-form" class="row">
+            <div class="grid">
+              <div>
+                <label for="id">ID</label>
+                <input id="id" required placeholder="例如 tokyo-night-walk" />
+              </div>
+              <div>
+                <label for="title">标题</label>
+                <input id="title" required placeholder="例如 东京夜路散步" />
+              </div>
+            </div>
+
+            <div>
+              <label for="description">描述</label>
+              <textarea id="description" placeholder="简短描述，用于前端视频卡片"></textarea>
+            </div>
+
+            <div class="grid">
+              <div>
+                <label for="provider">Provider</label>
+                <input id="provider" placeholder="例如 CyberNihongo" />
+              </div>
+              <div>
+                <label for="language">语言</label>
+                <input id="language" placeholder="例如 ja-JP" />
+              </div>
+            </div>
+
+            <div class="grid">
+              <div>
+                <label for="level">难度</label>
+                <input id="level" placeholder="例如 N4-N3" />
+              </div>
+              <div>
+                <label for="durationSeconds">时长（秒）</label>
+                <input id="durationSeconds" type="number" min="0" step="0.1" placeholder="可手填；上传媒体后会尝试自动识别" />
+              </div>
+            </div>
+
+            <div class="grid">
+              <div>
+                <label for="publishedAt">发布时间</label>
+                <input id="publishedAt" placeholder="ISO 时间，留空则使用当前时间" />
+              </div>
+              <div>
+                <label for="mediaType">媒体类型</label>
+                <select id="mediaType">
+                  <option value="video">video</option>
+                  <option value="audio">audio</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label for="tags">标签</label>
+              <input id="tags" placeholder="用英文逗号或中文逗号分隔，例如 城市, 夜景, 散步" />
+            </div>
+
+            <div>
+              <label for="referenceText">参考文本</label>
+              <textarea id="referenceText" placeholder="可选；若上传字幕 JSON 并包含 referenceText，也会同步写入"></textarea>
+            </div>
+
+            <div class="grid">
+              <div>
+                <label for="mediaUrl">外部媒体 URL</label>
+                <input id="mediaUrl" placeholder="可选；例如 COS 公网视频链接" />
+              </div>
+              <div>
+                <label for="downloadUrl">外部下载 URL</label>
+                <input id="downloadUrl" placeholder="可选；不填则默认复用媒体 URL" />
+              </div>
+            </div>
+
+            <div class="grid">
+              <div>
+                <label for="thumbnailUrl">外部缩略图 URL</label>
+                <input id="thumbnailUrl" placeholder="可选；例如 COS 图片链接" />
+              </div>
+              <div>
+                <label for="subtitleDocumentUrl">外部字幕 JSON URL</label>
+                <input id="subtitleDocumentUrl" placeholder="可选；例如 refined-subtitle.json" />
+              </div>
+            </div>
+
+            <div class="grid">
+              <div>
+                <label><input id="hasRefinedSubtitles" type="checkbox" /> 精修字幕</label>
+              </div>
+              <div>
+                <label><input id="hasTranslation" type="checkbox" /> 含翻译</label>
+              </div>
+            </div>
+
+            <div class="actions">
+              <button type="submit">保存元数据</button>
+              <button type="button" id="delete-btn" class="danger">删除条目</button>
+            </div>
+          </form>
+
+          <div class="row">
+            <div class="upload-box">
+              <label for="media-file">上传媒体文件</label>
+              <input id="media-file" type="file" accept="video/*,audio/*" />
+              <div class="actions">
+                <button id="upload-media-btn" type="button" class="ghost">上传媒体</button>
+              </div>
+            </div>
+
+            <div class="upload-box">
+              <label for="thumbnail-file">上传缩略图</label>
+              <input id="thumbnail-file" type="file" accept="image/*" />
+              <div class="actions">
+                <button id="upload-thumbnail-btn" type="button" class="ghost">上传缩略图</button>
+              </div>
+            </div>
+
+            <div class="upload-box">
+              <label for="subtitle-file">上传字幕 JSON</label>
+              <input id="subtitle-file" type="file" accept="application/json,.json" />
+              <div class="actions">
+                <button id="upload-subtitle-btn" type="button" class="ghost">上传字幕 JSON</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="row small muted">
+            <div>公开目录：<a href="/videos" target="_blank" rel="noreferrer">/videos</a></div>
+            <div>健康检查：<a href="/health" target="_blank" rel="noreferrer">/health</a></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      const ADMIN_TOKEN_STORAGE_KEY = 'media-service.admin-token';
+      const state = {
+        items: [],
+        filteredItems: [],
+        selectedId: '',
+        config: null,
+        adminToken: localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '',
+      };
+
+      const refs = {
+        serviceStatus: document.getElementById('service-status'),
+        editorStatus: document.getElementById('editor-status'),
+        videoList: document.getElementById('video-list'),
+        searchInput: document.getElementById('search-input'),
+        refreshBtn: document.getElementById('refresh-btn'),
+        newBtn: document.getElementById('new-btn'),
+        saveTokenBtn: document.getElementById('save-token-btn'),
+        clearTokenBtn: document.getElementById('clear-token-btn'),
+        adminToken: document.getElementById('admin-token'),
+        form: document.getElementById('meta-form'),
+        deleteBtn: document.getElementById('delete-btn'),
+        uploadMediaBtn: document.getElementById('upload-media-btn'),
+        uploadThumbnailBtn: document.getElementById('upload-thumbnail-btn'),
+        uploadSubtitleBtn: document.getElementById('upload-subtitle-btn'),
+        mediaFile: document.getElementById('media-file'),
+        thumbnailFile: document.getElementById('thumbnail-file'),
+        subtitleFile: document.getElementById('subtitle-file'),
+        id: document.getElementById('id'),
+        title: document.getElementById('title'),
+        description: document.getElementById('description'),
+        provider: document.getElementById('provider'),
+        language: document.getElementById('language'),
+        level: document.getElementById('level'),
+        durationSeconds: document.getElementById('durationSeconds'),
+        publishedAt: document.getElementById('publishedAt'),
+        mediaType: document.getElementById('mediaType'),
+        tags: document.getElementById('tags'),
+        referenceText: document.getElementById('referenceText'),
+        mediaUrl: document.getElementById('mediaUrl'),
+        downloadUrl: document.getElementById('downloadUrl'),
+        thumbnailUrl: document.getElementById('thumbnailUrl'),
+        subtitleDocumentUrl: document.getElementById('subtitleDocumentUrl'),
+        hasRefinedSubtitles: document.getElementById('hasRefinedSubtitles'),
+        hasTranslation: document.getElementById('hasTranslation'),
+      };
+
+      refs.adminToken.value = state.adminToken;
+
+      const setServiceStatus = (text) => { refs.serviceStatus.textContent = text; };
+      const setEditorStatus = (text) => { refs.editorStatus.textContent = text; };
+      const waitForNextPaint = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      const selectedItem = () => state.items.find((item) => item.id === state.selectedId) || null;
+
+      const apiFetch = async (url, options = {}) => {
+        const headers = new Headers(options.headers || {});
+        if (state.adminToken) headers.set('X-Admin-Token', state.adminToken);
+        return fetch(url, { ...options, headers });
+      };
+
+      const maxUploadBytes = (kind) => {
+        if (!state.config) return 0;
+        if (kind === 'media') return Number(state.config.maxMediaUploadMb || 0) * 1024 * 1024;
+        if (kind === 'subtitle') return Number(state.config.maxSubtitleUploadMb || 0) * 1024 * 1024;
+        return 0;
+      };
+
+      const fillForm = (item) => {
+        refs.id.value = item?.id || '';
+        refs.title.value = item?.title || '';
+        refs.description.value = item?.description || '';
+        refs.provider.value = item?.provider || 'cybernihongo-media-service';
+        refs.language.value = item?.language || 'ja-JP';
+        refs.level.value = item?.level || '';
+        refs.durationSeconds.value = item?.durationSeconds ?? '';
+        refs.publishedAt.value = item?.publishedAt || '';
+        refs.mediaType.value = item?.mediaType || 'video';
+        refs.tags.value = Array.isArray(item?.tags) ? item.tags.join(', ') : '';
+        refs.referenceText.value = item?.referenceText || '';
+        refs.mediaUrl.value = item?.mediaUrl || '';
+        refs.downloadUrl.value = item?.downloadUrl || '';
+        refs.thumbnailUrl.value = item?.thumbnailUrl || '';
+        refs.subtitleDocumentUrl.value = item?.subtitleDocumentUrl || '';
+        refs.hasRefinedSubtitles.checked = Boolean(item?.hasRefinedSubtitles);
+        refs.hasTranslation.checked = Boolean(item?.hasTranslation);
+      };
+
+      const formPayload = () => ({
+        id: refs.id.value.trim(),
+        title: refs.title.value.trim(),
+        description: refs.description.value.trim(),
+        provider: refs.provider.value.trim(),
+        language: refs.language.value.trim(),
+        level: refs.level.value.trim(),
+        durationSeconds: refs.durationSeconds.value.trim() ? Number(refs.durationSeconds.value) : undefined,
+        publishedAt: refs.publishedAt.value.trim(),
+        mediaType: refs.mediaType.value,
+        tags: refs.tags.value.split(/[\n,，]/).map((value) => value.trim()).filter(Boolean),
+        referenceText: refs.referenceText.value.trim(),
+        mediaUrl: refs.mediaUrl.value.trim(),
+        downloadUrl: refs.downloadUrl.value.trim(),
+        thumbnailUrl: refs.thumbnailUrl.value.trim(),
+        subtitleDocumentUrl: refs.subtitleDocumentUrl.value.trim(),
+        hasRefinedSubtitles: refs.hasRefinedSubtitles.checked,
+        hasTranslation: refs.hasTranslation.checked,
+      });
+
+      const updateUploadButtons = () => {
+        const disabled = Boolean(state.config && !state.config.allowLocalUploads);
+        refs.uploadMediaBtn.disabled = disabled;
+        refs.uploadThumbnailBtn.disabled = disabled;
+        refs.uploadSubtitleBtn.disabled = disabled;
+      };
+
+      const renderList = () => {
+        refs.videoList.innerHTML = '';
+        if (state.filteredItems.length === 0) {
+          refs.videoList.innerHTML = '<div class="status">当前没有条目。</div>';
+          return;
+        }
+        state.filteredItems.forEach((item) => {
+          const card = document.createElement('div');
+          card.className = `card ${item.id === state.selectedId ? 'active' : ''}`;
+          card.innerHTML = `
+            <h3>${item.title || item.id}</h3>
+            <div class="small muted">${item.id}</div>
+            <div class="small muted" style="margin-top:8px; line-height:1.6;">${item.description || '暂无描述'}</div>
+            <div class="chips">
+              <span class="chip">${item.language || 'unknown'}</span>
+              <span class="chip">${item.level || '未分级'}</span>
+              <span class="chip">${item.mediaFileExists ? '本地媒体' : (item.mediaUrl || item.downloadUrl) ? '外部媒体' : '缺媒体'}</span>
+              <span class="chip">${item.subtitleDocumentExists ? '本地字幕' : item.subtitleDocumentUrl ? '外部字幕' : '缺字幕'}</span>
+              <span class="chip">${item.public?.media_url ? 'web-app 可见' : 'web-app 隐藏'}</span>
+            </div>
+          `;
+          card.addEventListener('click', () => {
+            state.selectedId = item.id;
+            fillForm(item);
+            renderList();
+            setEditorStatus(`正在编辑 ${item.title || item.id}`);
+          });
+          refs.videoList.appendChild(card);
+        });
+      };
+
+      const applySearch = () => {
+        const keyword = refs.searchInput.value.trim().toLowerCase();
+        state.filteredItems = state.items.filter((item) => {
+          if (!keyword) return true;
+          return [
+            item.id,
+            item.title,
+            item.description,
+            item.level,
+            item.language,
+            item.provider,
+            item.mediaUrl,
+            item.downloadUrl,
+            item.thumbnailUrl,
+            item.subtitleDocumentUrl,
+            ...(item.tags || []),
+          ].some((value) => String(value || '').toLowerCase().includes(keyword));
+        });
+        renderList();
+      };
+
+      const loadConfig = async () => {
+        const response = await fetch('/admin/config');
+        state.config = await response.json();
+        updateUploadButtons();
+      };
+
+      const loadItems = async () => {
+        if (!state.config) await loadConfig();
+        if (state.config.adminProtected && !state.adminToken) {
+          setServiceStatus(`服务开启了管理鉴权。\n请先输入 Admin Token 后再刷新。\n当前存储模式：${state.config.storageMode}`);
+          state.items = [];
+          state.filteredItems = [];
+          renderList();
+          return;
+        }
+        setServiceStatus('正在拉取目录...');
+        const response = await apiFetch('/admin/videos');
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.message || '目录加载失败');
+        state.items = Array.isArray(payload.items) ? payload.items : [];
+        applySearch();
+        setServiceStatus(
+          `已加载 ${state.items.length} 条视频。\n存储模式：${state.config.storageMode}\n本地上传：${state.config.allowLocalUploads ? '已开启' : '已禁用'}\n媒体上传上限：${state.config.maxMediaUploadMb} MB`
+        );
+        if (state.selectedId) {
+          const matched = selectedItem();
+          if (matched) fillForm(matched);
+        }
+      };
+
+      const ensureSelectedId = () => {
+        const current = selectedItem();
+        if (current?.id) return current.id;
+        const id = refs.id.value.trim();
+        if (!id) {
+          setEditorStatus('请先填写并保存一个视频 ID。');
+          return '';
+        }
+        setEditorStatus('请先点击“保存元数据”。只有条目创建成功后，才能上传媒体、缩略图或字幕。');
+        return '';
+      };
+
+      const saveMetadata = async (event) => {
+        event.preventDefault();
+        const payload = formPayload();
+        if (!payload.id || !payload.title) {
+          setEditorStatus('ID 和标题不能为空。');
+          return;
+        }
+        const exists = state.items.some((item) => item.id === payload.id);
+        const response = await apiFetch(exists ? `/admin/videos/${payload.id}` : '/admin/videos', {
+          method: exists ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          setEditorStatus(result.message || '元数据保存失败。');
+          return;
+        }
+        state.selectedId = result.id;
+        await loadItems();
+        fillForm(result);
+        setEditorStatus(result.public?.media_url
+          ? `已保存 ${result.title}。`
+          : `已保存 ${result.title} 的元数据，但当前还没有可播放媒体地址。请继续上传媒体，或填写外部媒体 URL。`);
+      };
+
+      const uploadBinary = async (kind, input, endpoint) => {
+        if (state.config && !state.config.allowLocalUploads) {
+          setEditorStatus(`当前是 ${state.config.storageMode} 模式，已禁用本地${kind}上传。请改为填写外部 URL。`);
+          return;
+        }
+        const id = ensureSelectedId();
+        if (!id) return;
+        const file = input.files?.[0];
+        if (!file) {
+          setEditorStatus(`请先选择要上传的${kind}文件。`);
+          return;
+        }
+        const limit = maxUploadBytes(kind === '字幕' ? 'subtitle' : 'media');
+        if (limit > 0 && file.size > limit) {
+          setEditorStatus(`${kind}文件过大：${file.name}，已超过当前服务限制。`);
+          return;
+        }
+        setEditorStatus(`正在上传${kind}：${file.name}...`);
+        await waitForNextPaint();
+        const response = await apiFetch(`/admin/videos/${id}/${endpoint}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': file.type || 'application/octet-stream',
+            'X-Filename': file.name,
+          },
+          body: file,
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          setEditorStatus(result.message || `${kind}上传失败。`);
+          return;
+        }
+        state.selectedId = result.item.id;
+        await loadItems();
+        fillForm(result.item);
+        input.value = '';
+        const durationHint = kind === '媒体' && Number.isFinite(Number(result.detectedDurationSeconds))
+          ? `，已自动识别时长 ${Number(result.detectedDurationSeconds).toFixed(1)} 秒`
+          : '';
+        setEditorStatus(`${kind}上传成功：${result.uploaded}${durationHint}`);
+      };
+
+      const uploadSubtitle = async () => {
+        if (state.config && !state.config.allowLocalUploads) {
+          setEditorStatus(`当前是 ${state.config.storageMode} 模式，已禁用本地字幕上传。请改为填写外部字幕 JSON URL。`);
+          return;
+        }
+        const id = ensureSelectedId();
+        if (!id) return;
+        const file = refs.subtitleFile.files?.[0];
+        if (!file) {
+          setEditorStatus('请先选择字幕 JSON 文件。');
+          return;
+        }
+        const limit = maxUploadBytes('subtitle');
+        if (limit > 0 && file.size > limit) {
+          setEditorStatus(`字幕文件过大：${file.name}，已超过当前服务限制。`);
+          return;
+        }
+        setEditorStatus(`正在上传字幕：${file.name}...`);
+        await waitForNextPaint();
+        const text = await file.text();
+        const response = await apiFetch(`/admin/videos/${id}/subtitle-document`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Filename': file.name,
+          },
+          body: text,
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          setEditorStatus(result.message || '字幕上传失败。');
+          return;
+        }
+        state.selectedId = result.item.id;
+        await loadItems();
+        fillForm(result.item);
+        refs.subtitleFile.value = '';
+        setEditorStatus(`字幕上传成功：${result.uploaded}`);
+      };
+
+      const createNewItem = () => {
+        state.selectedId = '';
+        fillForm({ provider: 'cybernihongo-media-service', language: 'ja-JP', mediaType: 'video' });
+        renderList();
+        setEditorStatus('已切换到新建模式。先填写 ID 和标题，再保存元数据。');
+      };
+
+      const deleteCurrent = async () => {
+        const current = selectedItem() || (refs.id.value.trim() ? { id: refs.id.value.trim(), title: refs.title.value.trim() } : null);
+        if (!current?.id) {
+          setEditorStatus('当前没有可删除的条目。');
+          return;
+        }
+        const confirmed = window.confirm(`确认删除 ${current.title || current.id} 吗？\n点“确定”会同时删除关联本地媒体、缩略图和字幕文件。`);
+        if (!confirmed) return;
+        const response = await apiFetch(`/admin/videos/${current.id}?deleteFiles=1`, { method: 'DELETE' });
+        const result = await response.json();
+        if (!response.ok) {
+          setEditorStatus(result.message || '删除失败。');
+          return;
+        }
+        state.selectedId = '';
+        createNewItem();
+        await loadItems();
+        setEditorStatus(`已删除 ${current.id}`);
+      };
+
+      const saveToken = () => {
+        state.adminToken = refs.adminToken.value.trim();
+        if (state.adminToken) {
+          localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, state.adminToken);
+          setServiceStatus('Admin Token 已保存到当前浏览器。请点击“刷新列表”继续。');
+        } else {
+          localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+          setServiceStatus('Admin Token 已清空。');
+        }
+      };
+
+      const clearToken = () => {
+        refs.adminToken.value = '';
+        state.adminToken = '';
+        localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+        setServiceStatus('Admin Token 已清空。');
+      };
+
+      refs.refreshBtn.addEventListener('click', () => { loadItems().catch((error) => setServiceStatus(error.message)); });
+      refs.newBtn.addEventListener('click', createNewItem);
+      refs.saveTokenBtn.addEventListener('click', saveToken);
+      refs.clearTokenBtn.addEventListener('click', clearToken);
+      refs.searchInput.addEventListener('input', applySearch);
+      refs.form.addEventListener('submit', (event) => { saveMetadata(event).catch((error) => setEditorStatus(error.message)); });
+      refs.uploadMediaBtn.addEventListener('click', () => { uploadBinary('媒体', refs.mediaFile, 'media').catch((error) => setEditorStatus(error.message)); });
+      refs.uploadThumbnailBtn.addEventListener('click', () => { uploadBinary('缩略图', refs.thumbnailFile, 'thumbnail').catch((error) => setEditorStatus(error.message)); });
+      refs.uploadSubtitleBtn.addEventListener('click', () => { uploadSubtitle().catch((error) => setEditorStatus(error.message)); });
+      refs.deleteBtn.addEventListener('click', () => { deleteCurrent().catch((error) => setEditorStatus(error.message)); });
+
+      createNewItem();
+      loadConfig().then(() => loadItems()).catch((error) => setServiceStatus(error.message));
+    </script>
+  </body>
+</html>

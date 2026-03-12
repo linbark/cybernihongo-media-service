@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import {
   CLOUDBASE_RDB_DRIVER,
   inferMediaDriver,
@@ -98,8 +98,11 @@ const ensureMysqlIndexes = async (pool) => {
 
 const runSqliteMigrations = ({ dbFilePath, migrationDir, files }) => {
   ensureDir(path.dirname(dbFilePath));
-  const db = new Database(dbFilePath);
+  const db = new DatabaseSync(dbFilePath);
   db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+    PRAGMA synchronous = NORMAL;
     CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (
       name TEXT PRIMARY KEY,
       applied_at TEXT NOT NULL
@@ -109,15 +112,19 @@ const runSqliteMigrations = ({ dbFilePath, migrationDir, files }) => {
   const appliedRows = db.prepare(`SELECT name FROM ${MIGRATION_TABLE} ORDER BY name ASC`).all();
   const applied = new Set(appliedRows.map((row) => row.name));
   const markAppliedStmt = db.prepare(`INSERT INTO ${MIGRATION_TABLE} (name, applied_at) VALUES (?, ?)`);
-  const applyMigration = db.transaction((fileName, sql, appliedAt) => {
-    db.exec(sql);
-    markAppliedStmt.run(fileName, appliedAt);
-  });
 
   let appliedCount = 0;
   for (const fileName of files) {
     if (applied.has(fileName)) continue;
-    applyMigration(fileName, readSql(migrationDir, fileName), new Date().toISOString());
+    db.exec('BEGIN');
+    try {
+      db.exec(readSql(migrationDir, fileName));
+      markAppliedStmt.run(fileName, new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
     appliedCount += 1;
   }
 

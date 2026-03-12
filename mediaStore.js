@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import {
   buildCloudbaseInitOptions,
   CLOUDBASE_RDB_DRIVER,
@@ -25,6 +25,14 @@ const normalizeInteger = (value) => {
   if (typeof value === 'string' && value.trim()) {
     const parsed = Number(value);
     if (Number.isFinite(parsed)) return Math.round(parsed);
+  }
+  return null;
+};
+const normalizeNumber = (value) => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
   }
   return null;
 };
@@ -110,6 +118,7 @@ const mapRowToVideo = (row) => {
     level: row.level || '',
     tags,
     status: row.status || 'active',
+    durationSeconds: row.duration_seconds === null || row.duration_seconds === undefined ? null : Number(row.duration_seconds),
     publishedAt: row.published_at || '',
     coverAssetId: row.cover_asset_id || '',
     sourceAssetId: row.source_asset_id || '',
@@ -139,6 +148,7 @@ const mapVideoToParams = (video, now = new Date().toISOString()) => ({
   level: normalizeString(video.level),
   tags_json: JSON.stringify(normalizeTags(video.tags)),
   status: normalizeString(video.status, 'active'),
+  duration_seconds: normalizeNumber(video.durationSeconds),
   published_at: normalizeString(video.publishedAt, now),
   cover_asset_id: normalizeString(video.coverAssetId),
   source_asset_id: normalizeString(video.sourceAssetId),
@@ -256,6 +266,7 @@ const SQLITE_DDL = `
     level TEXT NOT NULL DEFAULT '',
     tags_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'active',
+    duration_seconds REAL NULL,
     published_at TEXT NOT NULL DEFAULT '',
     cover_asset_id TEXT NOT NULL DEFAULT '',
     source_asset_id TEXT NOT NULL DEFAULT '',
@@ -321,11 +332,13 @@ const SQLITE_DDL = `
 
 const createSqliteStore = async ({ dbFilePath }) => {
   ensureDir(path.dirname(dbFilePath));
-  const db = new Database(dbFilePath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('user_version = 1');
+  const db = new DatabaseSync(dbFilePath);
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA user_version = 1;
+  `);
   db.exec(SQLITE_DDL);
 
   const selectVideoByIdStmt = db.prepare('SELECT * FROM videos WHERE id = ? LIMIT 1');
@@ -336,13 +349,13 @@ const createSqliteStore = async ({ dbFilePath }) => {
   const insertVideoStmt = db.prepare(`
     INSERT INTO videos (
       id, title, description, provider, language, level, tags_json, status,
-      published_at, cover_asset_id, source_asset_id, subtitle_asset_id, media_type,
+      duration_seconds, published_at, cover_asset_id, source_asset_id, subtitle_asset_id, media_type,
       media_file, thumbnail_file, subtitle_document_file, media_url, download_url,
       thumbnail_url, subtitle_document_url, reference_text, has_refined_subtitles,
       has_translation, created_at, updated_at
     ) VALUES (
       @id, @title, @description, @provider, @language, @level, @tags_json, @status,
-      @published_at, @cover_asset_id, @source_asset_id, @subtitle_asset_id, @media_type,
+      @duration_seconds, @published_at, @cover_asset_id, @source_asset_id, @subtitle_asset_id, @media_type,
       @media_file, @thumbnail_file, @subtitle_document_file, @media_url, @download_url,
       @thumbnail_url, @subtitle_document_url, @reference_text, @has_refined_subtitles,
       @has_translation, @created_at, @updated_at
@@ -357,6 +370,7 @@ const createSqliteStore = async ({ dbFilePath }) => {
       level = @level,
       tags_json = @tags_json,
       status = @status,
+      duration_seconds = @duration_seconds,
       published_at = @published_at,
       cover_asset_id = @cover_asset_id,
       source_asset_id = @source_asset_id,
@@ -411,6 +425,7 @@ const createSqliteStore = async ({ dbFilePath }) => {
       updated_at = @updated_at
     WHERE id = @id
   `);
+  const deleteVideoStmt = db.prepare('DELETE FROM videos WHERE id = ?');
 
   return {
     driver: 'sqlite',
@@ -445,8 +460,13 @@ const createSqliteStore = async ({ dbFilePath }) => {
       const current = mapRowToVideo(selectVideoByIdStmt.get(id));
       if (!current) throw new Error('Video not found.');
       const params = toSqliteParams(mapVideoToParams({ ...current, ...nextVideo, id, createdAt: current.createdAt }));
-      updateVideoStmt.run(params);
+      const { created_at, ...updateParams } = params;
+      updateVideoStmt.run(updateParams);
       return mapRowToVideo(selectVideoByIdStmt.get(id));
+    },
+    async deleteVideo(id) {
+      deleteVideoStmt.run(id);
+      return true;
     },
     async createMediaAsset(asset) {
       const params = mapMediaAssetToParams(asset);
@@ -471,7 +491,8 @@ const createSqliteStore = async ({ dbFilePath }) => {
       const current = mapRowToUploadSession(selectUploadSessionByIdStmt.get(id));
       if (!current) throw new Error('Upload session not found.');
       const params = mapUploadSessionToParams({ ...current, ...patch, id, createdAt: current.createdAt });
-      updateUploadSessionStmt.run(params);
+      const { created_at, ...updateParams } = params;
+      updateUploadSessionStmt.run(updateParams);
       return mapRowToUploadSession(selectUploadSessionByIdStmt.get(id));
     },
     async ping() {
@@ -497,6 +518,7 @@ const createPostgresStore = async ({ databaseUrl }) => {
       level TEXT NOT NULL DEFAULT '',
       tags_json TEXT NOT NULL DEFAULT '[]',
       status TEXT NOT NULL DEFAULT 'active',
+      duration_seconds DOUBLE PRECISION NULL,
       published_at TEXT NOT NULL DEFAULT '',
       cover_asset_id TEXT NOT NULL DEFAULT '',
       source_asset_id TEXT NOT NULL DEFAULT '',
@@ -599,12 +621,12 @@ const createPostgresStore = async ({ databaseUrl }) => {
       await pool.query(
         `INSERT INTO videos (
           id, title, description, provider, language, level, tags_json, status,
-          published_at, cover_asset_id, source_asset_id, subtitle_asset_id, media_type,
+          duration_seconds, published_at, cover_asset_id, source_asset_id, subtitle_asset_id, media_type,
           media_file, thumbnail_file, subtitle_document_file, media_url, download_url,
           thumbnail_url, subtitle_document_url, reference_text, has_refined_subtitles,
           has_translation, created_at, updated_at
         ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26
         )`,
         [
           params.id,
@@ -615,6 +637,7 @@ const createPostgresStore = async ({ databaseUrl }) => {
           params.level,
           params.tags_json,
           params.status,
+          params.duration_seconds,
           params.published_at,
           params.cover_asset_id,
           params.source_asset_id,
@@ -649,22 +672,23 @@ const createPostgresStore = async ({ databaseUrl }) => {
           level = $6,
           tags_json = $7,
           status = $8,
-          published_at = $9,
-          cover_asset_id = $10,
-          source_asset_id = $11,
-          subtitle_asset_id = $12,
-          media_type = $13,
-          media_file = $14,
-          thumbnail_file = $15,
-          subtitle_document_file = $16,
-          media_url = $17,
-          download_url = $18,
-          thumbnail_url = $19,
-          subtitle_document_url = $20,
-          reference_text = $21,
-          has_refined_subtitles = $22,
-          has_translation = $23,
-          updated_at = $24
+          duration_seconds = $9,
+          published_at = $10,
+          cover_asset_id = $11,
+          source_asset_id = $12,
+          subtitle_asset_id = $13,
+          media_type = $14,
+          media_file = $15,
+          thumbnail_file = $16,
+          subtitle_document_file = $17,
+          media_url = $18,
+          download_url = $19,
+          thumbnail_url = $20,
+          subtitle_document_url = $21,
+          reference_text = $22,
+          has_refined_subtitles = $23,
+          has_translation = $24,
+          updated_at = $25
         WHERE id = $1`,
         [
           params.id,
@@ -675,6 +699,7 @@ const createPostgresStore = async ({ databaseUrl }) => {
           params.level,
           params.tags_json,
           params.status,
+          params.duration_seconds,
           params.published_at,
           params.cover_asset_id,
           params.source_asset_id,
@@ -694,6 +719,10 @@ const createPostgresStore = async ({ databaseUrl }) => {
         ],
       );
       return this.getVideoById(id);
+    },
+    async deleteVideo(id) {
+      await pool.query('DELETE FROM videos WHERE id = $1', [id]);
+      return true;
     },
     async createMediaAsset(asset) {
       const params = mapMediaAssetToParams(asset);
@@ -827,6 +856,7 @@ const createMysqlStore = async ({ databaseUrl }) => {
       level VARCHAR(64) NOT NULL,
       tags_json LONGTEXT NOT NULL,
       status VARCHAR(32) NOT NULL DEFAULT 'active',
+      duration_seconds DOUBLE NULL,
       published_at VARCHAR(64) NOT NULL,
       cover_asset_id VARCHAR(191) NOT NULL DEFAULT '',
       source_asset_id VARCHAR(191) NOT NULL DEFAULT '',
@@ -932,11 +962,11 @@ const createMysqlStore = async ({ databaseUrl }) => {
       const params = mapVideoToParams(video);
       await pool.query(
         `INSERT INTO videos (
-          id, title, description, provider, language, level, tags_json, status, published_at,
+          id, title, description, provider, language, level, tags_json, status, duration_seconds, published_at,
           cover_asset_id, source_asset_id, subtitle_asset_id, media_type, media_file, thumbnail_file,
           subtitle_document_file, media_url, download_url, thumbnail_url, subtitle_document_url,
           reference_text, has_refined_subtitles, has_translation, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           params.id,
           params.title,
@@ -946,6 +976,7 @@ const createMysqlStore = async ({ databaseUrl }) => {
           params.level,
           params.tags_json,
           params.status,
+          params.duration_seconds,
           params.published_at,
           params.cover_asset_id,
           params.source_asset_id,
@@ -980,6 +1011,7 @@ const createMysqlStore = async ({ databaseUrl }) => {
           level = ?,
           tags_json = ?,
           status = ?,
+          duration_seconds = ?,
           published_at = ?,
           cover_asset_id = ?,
           source_asset_id = ?,
@@ -1005,6 +1037,7 @@ const createMysqlStore = async ({ databaseUrl }) => {
           params.level,
           params.tags_json,
           params.status,
+          params.duration_seconds,
           params.published_at,
           params.cover_asset_id,
           params.source_asset_id,
@@ -1025,6 +1058,10 @@ const createMysqlStore = async ({ databaseUrl }) => {
         ],
       );
       return this.getVideoById(id);
+    },
+    async deleteVideo(id) {
+      await pool.query('DELETE FROM videos WHERE id = ?', [id]);
+      return true;
     },
     async createMediaAsset(asset) {
       const params = mapMediaAssetToParams(asset);
@@ -1214,6 +1251,13 @@ const createCloudbaseRdbStore = async ({ envConfig }) => {
         `CloudBase RDB 更新视频 ${id} 失败`,
       );
       return this.getVideoById(id);
+    },
+    async deleteVideo(id) {
+      ensureCloudbaseSuccess(
+        await tableRef(rdbConfig.videosTable).delete().eq('id', id),
+        `CloudBase RDB 删除视频 ${id} 失败`,
+      );
+      return true;
     },
     async createMediaAsset(asset) {
       const params = mapMediaAssetToParams(asset);

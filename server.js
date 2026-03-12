@@ -1,17 +1,21 @@
 import express from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createMediaStore } from './mediaStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
+const execFileAsync = promisify(execFile);
 
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8786);
 const SERVICE_NAME = 'cybernihongo-media-service';
-const VERSION = 1;
+const VERSION = 2;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, '') || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim() || '';
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN?.trim() || '';
@@ -24,7 +28,26 @@ const MEDIA_BUCKET = process.env.MEDIA_BUCKET?.trim() || '';
 const MEDIA_UPLOAD_KEY_PREFIX = process.env.MEDIA_UPLOAD_KEY_PREFIX?.trim().replace(/^\/+|\/+$/g, '') || 'uploads';
 const MEDIA_UPLOAD_SESSION_TTL_SEC = Math.max(60, Number(process.env.MEDIA_UPLOAD_SESSION_TTL_SEC || 1800));
 const MEDIA_ASSET_PUBLIC_BASE_URL = process.env.MEDIA_ASSET_PUBLIC_BASE_URL?.trim().replace(/\/$/, '') || '';
+const STORAGE_MODE = process.env.STORAGE_MODE?.trim() === 'external' ? 'external' : 'local';
+const EXTERNAL_MEDIA_BASE_URL = process.env.EXTERNAL_MEDIA_BASE_URL?.trim().replace(/\/$/, '') || '';
+const EXTERNAL_THUMBNAIL_BASE_URL = process.env.EXTERNAL_THUMBNAIL_BASE_URL?.trim().replace(/\/$/, '') || '';
+const EXTERNAL_SUBTITLE_BASE_URL = process.env.EXTERNAL_SUBTITLE_BASE_URL?.trim().replace(/\/$/, '') || '';
+const ALLOW_LOCAL_UPLOADS = process.env.ALLOW_LOCAL_UPLOADS
+  ? ['1', 'true', 'yes', 'on'].includes(process.env.ALLOW_LOCAL_UPLOADS.trim().toLowerCase())
+  : STORAGE_MODE === 'local';
+const MAX_MEDIA_UPLOAD_MB = Number(process.env.MAX_MEDIA_UPLOAD_MB || 512);
+const MAX_SUBTITLE_UPLOAD_MB = Number(process.env.MAX_SUBTITLE_UPLOAD_MB || 8);
+const FFPROBE_BIN = process.env.FFPROBE_BIN?.trim() || 'ffprobe';
 const TCB_ENV_ID = process.env.TCB_ENV_ID?.trim() || process.env.CLOUDBASE_ENV_ID?.trim() || '';
+
+const DATA_DIR = path.join(__dirname, 'data');
+const MEDIA_DIR = path.join(DATA_DIR, 'media');
+const THUMBNAIL_DIR = path.join(DATA_DIR, 'thumbnails');
+const SUBTITLE_DIR = path.join(DATA_DIR, 'subtitles');
+const ADMIN_DIR = path.join(__dirname, 'admin');
+
+const ensureDir = (directory) => fs.mkdirSync(directory, { recursive: true });
+[DATA_DIR, MEDIA_DIR, THUMBNAIL_DIR, SUBTITLE_DIR, ADMIN_DIR].forEach(ensureDir);
 
 const mediaStore = await createMediaStore({
   driver: MEDIA_DB_DRIVER,
@@ -34,6 +57,8 @@ const mediaStore = await createMediaStore({
 const MEDIA_BACKEND = mediaStore.driver;
 
 const jsonParser = express.json({ limit: '2mb' });
+const rawMediaParser = express.raw({ type: '*/*', limit: `${MAX_MEDIA_UPLOAD_MB}mb` });
+const textParser = express.text({ type: '*/*', limit: `${MAX_SUBTITLE_UPLOAD_MB}mb` });
 
 const normalizeString = (value, fallback = '') => (typeof value === 'string' ? value.trim() : fallback);
 const coerceBoolean = (value, fallback = false) => {
@@ -75,7 +100,44 @@ const sanitizeFileName = (value) =>
     .replace(/\s+/g, '-')
     .replace(/^-+|-+$/g, '');
 const isObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
-
+const inferMediaTypeFromFileName = (fileName) => /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(fileName) ? 'audio' : 'video';
+const buildObjectKey = ({ fileName = '' }) => {
+  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '/');
+  const safeName = sanitizeFileName(fileName || 'media.bin') || 'media.bin';
+  return `${MEDIA_UPLOAD_KEY_PREFIX}/${today}/${randomUUID()}-${safeName}`;
+};
+const resolveExistingFile = (directory, fileName) => {
+  const cleanFileName = sanitizeFileName(fileName);
+  if (!cleanFileName) return '';
+  const filePath = path.join(directory, cleanFileName);
+  return fs.existsSync(filePath) ? filePath : '';
+};
+const resolveUploadFileName = (id, headerFileName, defaultExtension) => {
+  const cleanHeader = sanitizeFileName(headerFileName);
+  if (cleanHeader) {
+    const ext = path.extname(cleanHeader);
+    return ext ? `${id}${ext.toLowerCase()}` : `${id}${defaultExtension}`;
+  }
+  return `${id}${defaultExtension}`;
+};
+const writeBinaryFile = (directory, fileName, buffer) => {
+  ensureDir(directory);
+  const targetPath = path.join(directory, fileName);
+  fs.writeFileSync(targetPath, buffer);
+  return targetPath;
+};
+const extractUploadDisplayTitle = (value) => {
+  const rawName = normalizeString(value);
+  if (!rawName) return '';
+  const baseName = rawName.split(/[\\/]/).pop() || '';
+  return path.parse(baseName).name.trim();
+};
+const shouldReplaceTitleFromUpload = (item, uploadedTitle) => {
+  if (!uploadedTitle) return false;
+  const currentTitle = normalizeString(item?.title);
+  const currentId = normalizeString(item?.id);
+  return !currentTitle || currentTitle === currentId;
+};
 const getBaseUrl = (req) => PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
 const createHttpError = (status, message) => {
   const error = new Error(message);
@@ -88,6 +150,86 @@ const withErrorHandling = (handler) => async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+const buildCloudFileId = ({ bucket = '', objectKey = '' }) => {
+  if (!bucket || !objectKey || !TCB_ENV_ID) return '';
+  return `cloud://${TCB_ENV_ID}.${bucket}/${objectKey}`;
+};
+const buildPublicAssetUrl = (objectKey) => {
+  if (!MEDIA_ASSET_PUBLIC_BASE_URL || !objectKey) return '';
+  try {
+    return new URL(objectKey, `${MEDIA_ASSET_PUBLIC_BASE_URL}/`).toString();
+  } catch {
+    return `${MEDIA_ASSET_PUBLIC_BASE_URL}/${objectKey}`;
+  }
+};
+const buildAbsoluteUrl = (value, req) => {
+  if (!value) return '';
+  try {
+    return new URL(value, `${getBaseUrl(req)}/`).toString();
+  } catch {
+    return value;
+  }
+};
+const buildExternalAssetUrl = (baseUrl, fileName, req) => {
+  if (!baseUrl || !fileName) return '';
+  try {
+    return new URL(fileName, `${baseUrl}/`).toString();
+  } catch {
+    return buildAbsoluteUrl(`${baseUrl}/${fileName}`, req);
+  }
+};
+
+let hasLoggedMissingDurationProbe = false;
+const probeMediaDurationSeconds = async (mediaPath) => {
+  try {
+    const { stdout } = await execFileAsync(
+      FFPROBE_BIN,
+      [
+        '-v',
+        'error',
+        '-show_entries',
+        'format=duration',
+        '-of',
+        'default=noprint_wrappers=1:nokey=1',
+        mediaPath,
+      ],
+      { timeout: 15000 },
+    );
+    const parsed = Number(String(stdout || '').trim());
+    if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+    return Number(parsed.toFixed(3));
+  } catch (error) {
+    if (!hasLoggedMissingDurationProbe && error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      hasLoggedMissingDurationProbe = true;
+      console.warn(`[${SERVICE_NAME}] ffprobe not found, skip auto duration detection. Set FFPROBE_BIN or install ffmpeg.`);
+      return undefined;
+    }
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return undefined;
+    }
+    console.warn(`[${SERVICE_NAME}] Failed to detect media duration for ${mediaPath}:`, error instanceof Error ? error.message : error);
+    return undefined;
+  }
+};
+
+const subtitleSummaryFromDocument = (document) => {
+  const segments = Array.isArray(document?.segments) ? document.segments : [];
+  const referenceText = typeof document?.referenceText === 'string'
+    ? document.referenceText.trim()
+    : segments
+        .map((segment) => (typeof segment?.text === 'string' ? segment.text.trim() : ''))
+        .filter(Boolean)
+        .join('\n');
+  const hasTranslation = segments.some((segment) => {
+    if (typeof segment?.translation === 'string' && segment.translation.trim()) return true;
+    return Array.isArray(segment?.tokens) && segment.tokens.some((token) => typeof token?.translation === 'string' && token.translation.trim());
+  });
+  return {
+    hasRefinedSubtitles: segments.length > 0,
+    hasTranslation,
+    referenceText,
+  };
 };
 
 const requireAdmin = (req, res, next) => {
@@ -117,24 +259,10 @@ const requireInternal = (req, res, next) => {
   res.status(401).json({ message: 'Unauthorized internal request.' });
 };
 
-const buildCloudFileId = ({ bucket = '', objectKey = '' }) => {
-  if (!bucket || !objectKey || !TCB_ENV_ID) return '';
-  return `cloud://${TCB_ENV_ID}.${bucket}/${objectKey}`;
-};
-
-const buildPublicAssetUrl = (objectKey) => {
-  if (!MEDIA_ASSET_PUBLIC_BASE_URL || !objectKey) return '';
-  try {
-    return new URL(objectKey, `${MEDIA_ASSET_PUBLIC_BASE_URL}/`).toString();
-  } catch {
-    return `${MEDIA_ASSET_PUBLIC_BASE_URL}/${objectKey}`;
+const assertUploadsEnabled = () => {
+  if (!ALLOW_LOCAL_UPLOADS) {
+    throw createHttpError(409, '当前服务已配置为外部存储模式，已禁用本地文件上传。请改为在元数据中填写对象存储/COS 公网 URL。');
   }
-};
-
-const buildObjectKey = ({ fileName = '' }) => {
-  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '/');
-  const safeName = sanitizeFileName(fileName || 'media.bin') || 'media.bin';
-  return `${MEDIA_UPLOAD_KEY_PREFIX}/${today}/${randomUUID()}-${safeName}`;
 };
 
 const normalizeVideoPayload = (payload, existing = null) => {
@@ -152,6 +280,7 @@ const normalizeVideoPayload = (payload, existing = null) => {
     level: normalizeString(payload.level, existing?.level || ''),
     tags: coerceTags(payload.tags, existing?.tags || []),
     status: normalizeString(payload.status, existing?.status || 'active'),
+    durationSeconds: coerceNumber(payload.durationSeconds ?? payload.duration_seconds, existing?.durationSeconds ?? null),
     publishedAt: normalizeString(payload.publishedAt || payload.published_at, existing?.publishedAt || new Date().toISOString()),
     coverAssetId: normalizeString(payload.coverAssetId || payload.cover_asset_id, existing?.coverAssetId || ''),
     sourceAssetId: normalizeString(payload.sourceAssetId || payload.source_asset_id, existing?.sourceAssetId || ''),
@@ -172,17 +301,50 @@ const normalizeVideoPayload = (payload, existing = null) => {
   };
 };
 
-const buildPublicCatalogItem = async (req, item) => {
-  const sourceAsset = item.sourceAssetId ? await mediaStore.getMediaAssetById(item.sourceAssetId) : null;
-  const subtitleAsset = item.subtitleAssetId ? await mediaStore.getMediaAssetById(item.subtitleAssetId) : null;
+const resolvePublishedAssetUrls = async (req, item) => {
+  const baseUrl = getBaseUrl(req);
+  const localMediaPath = resolveExistingFile(MEDIA_DIR, item.mediaFile);
+  const localThumbnailPath = resolveExistingFile(THUMBNAIL_DIR, item.thumbnailFile);
+  const localSubtitlePath = resolveExistingFile(SUBTITLE_DIR, item.subtitleDocumentFile);
+  const [sourceAsset, subtitleAsset] = await Promise.all([
+    item.sourceAssetId ? mediaStore.getMediaAssetById(item.sourceAssetId) : null,
+    item.subtitleAssetId ? mediaStore.getMediaAssetById(item.subtitleAssetId) : null,
+  ]);
 
   const sourceObjectUrl = sourceAsset?.objectKey ? buildPublicAssetUrl(sourceAsset.objectKey) : '';
   const subtitleObjectUrl = subtitleAsset?.objectKey ? buildPublicAssetUrl(subtitleAsset.objectKey) : '';
+  const mediaUrl = buildAbsoluteUrl(item.mediaUrl, req)
+    || (localMediaPath ? `${baseUrl}/media/${encodeURIComponent(item.id)}/stream` : '')
+    || sourceObjectUrl
+    || buildExternalAssetUrl(EXTERNAL_MEDIA_BASE_URL, item.mediaFile, req);
+  const downloadUrl = buildAbsoluteUrl(item.downloadUrl, req)
+    || (localMediaPath ? `${baseUrl}/media/${encodeURIComponent(item.id)}/download` : '')
+    || mediaUrl
+    || sourceObjectUrl
+    || buildExternalAssetUrl(EXTERNAL_MEDIA_BASE_URL, item.mediaFile, req);
+  const thumbnailUrl = buildAbsoluteUrl(item.thumbnailUrl, req)
+    || (localThumbnailPath ? `${baseUrl}/media/${encodeURIComponent(item.id)}/thumbnail` : '')
+    || buildExternalAssetUrl(EXTERNAL_THUMBNAIL_BASE_URL, item.thumbnailFile, req);
+  const subtitleDocumentUrl = buildAbsoluteUrl(item.subtitleDocumentUrl, req)
+    || (localSubtitlePath ? `${baseUrl}/videos/${encodeURIComponent(item.id)}/subtitle-document` : '')
+    || subtitleObjectUrl
+    || buildExternalAssetUrl(EXTERNAL_SUBTITLE_BASE_URL, item.subtitleDocumentFile, req);
 
-  const mediaUrl = normalizeString(item.mediaUrl) || sourceObjectUrl;
-  const downloadUrl = normalizeString(item.downloadUrl) || mediaUrl;
-  const subtitleDocumentUrl = normalizeString(item.subtitleDocumentUrl) || subtitleObjectUrl;
+  return {
+    mediaUrl,
+    downloadUrl,
+    thumbnailUrl,
+    subtitleDocumentUrl,
+    mediaFileExists: Boolean(localMediaPath),
+    thumbnailFileExists: Boolean(localThumbnailPath),
+    subtitleDocumentExists: Boolean(localSubtitlePath),
+    sourceAsset,
+    subtitleAsset,
+  };
+};
 
+const buildPublicCatalogItem = async (req, item) => {
+  const published = await resolvePublishedAssetUrls(req, item);
   return {
     id: item.id,
     title: item.title,
@@ -192,12 +354,13 @@ const buildPublicCatalogItem = async (req, item) => {
     level: item.level,
     tags: item.tags || [],
     status: item.status || 'active',
+    duration_seconds: item.durationSeconds ?? undefined,
     published_at: item.publishedAt,
     media_type: item.mediaType || 'video',
-    media_url: mediaUrl,
-    download_url: downloadUrl,
-    thumbnail_url: normalizeString(item.thumbnailUrl),
-    subtitle_document_url: subtitleDocumentUrl,
+    media_url: published.mediaUrl,
+    download_url: published.downloadUrl,
+    thumbnail_url: published.thumbnailUrl,
+    subtitle_document_url: published.subtitleDocumentUrl,
     reference_text: item.referenceText || '',
     has_refined_subtitles: Boolean(item.hasRefinedSubtitles),
     has_translation: Boolean(item.hasTranslation),
@@ -210,11 +373,35 @@ const buildPublicCatalogItem = async (req, item) => {
   };
 };
 
+const buildAdminCatalogItem = async (req, item) => {
+  const published = await resolvePublishedAssetUrls(req, item);
+  return {
+    ...item,
+    ...published,
+    public: await buildPublicCatalogItem(req, item),
+  };
+};
+
+const maybeRedirectToExternalAsset = (req, res, publishedUrl) => {
+  if (!publishedUrl) {
+    res.status(404).json({ message: 'Asset not found.' });
+    return true;
+  }
+  const selfUrl = `${getBaseUrl(req)}${req.originalUrl}`;
+  if (publishedUrl === selfUrl) {
+    res.status(404).json({ message: 'Asset not found.' });
+    return true;
+  }
+  res.redirect(302, publishedUrl);
+  return true;
+};
+
 app.disable('x-powered-by');
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,PUT,PATCH');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Admin-Token, X-Internal-Token');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,PUT,PATCH,DELETE');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, X-Filename, X-Admin-Token, X-Internal-Token');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition');
   if (req.method === 'OPTIONS') {
     res.status(204).end();
     return;
@@ -222,17 +409,35 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/', (_req, res) => {
+app.get('/admin/config', withErrorHandling(async (_req, res) => {
   res.json({
     service: SERVICE_NAME,
     version: VERSION,
-    docs: {
-      health: '/health',
-      listVideos: '/videos',
-      createUploadSession: '/upload-sessions',
-      confirmUploadSession: '/upload-sessions/:id/confirm',
-    },
+    adminProtected: Boolean(ADMIN_TOKEN),
+    internalProtected: Boolean(INTERNAL_TOKEN || ADMIN_TOKEN),
+    storageMode: STORAGE_MODE,
+    allowLocalUploads: ALLOW_LOCAL_UPLOADS,
+    mediaBackend: MEDIA_BACKEND,
+    mediaConnection: mediaStore.connectionSummary,
+    mediaStorageProvider: MEDIA_STORAGE_PROVIDER,
+    mediaUploadMode: MEDIA_UPLOAD_MODE,
+    maxMediaUploadMb: MAX_MEDIA_UPLOAD_MB,
+    maxSubtitleUploadMb: MAX_SUBTITLE_UPLOAD_MB,
+    mediaBucket: MEDIA_BUCKET || undefined,
+    mediaAssetPublicBaseUrl: MEDIA_ASSET_PUBLIC_BASE_URL || undefined,
+    externalMediaBaseUrl: EXTERNAL_MEDIA_BASE_URL || undefined,
+    externalThumbnailBaseUrl: EXTERNAL_THUMBNAIL_BASE_URL || undefined,
+    externalSubtitleBaseUrl: EXTERNAL_SUBTITLE_BASE_URL || undefined,
   });
+}));
+
+app.get('/admin', (_req, res) => {
+  res.sendFile(path.join(ADMIN_DIR, 'index.html'));
+});
+app.use('/admin', express.static(ADMIN_DIR));
+
+app.get('/', (_req, res) => {
+  res.redirect('/admin');
 });
 
 app.get('/health', withErrorHandling(async (_req, res) => {
@@ -254,6 +459,8 @@ app.get('/health', withErrorHandling(async (_req, res) => {
     version: VERSION,
     mediaBackend: MEDIA_BACKEND,
     mediaConnection: mediaStore.connectionSummary,
+    storageMode: STORAGE_MODE,
+    allowLocalUploads: ALLOW_LOCAL_UPLOADS,
     storage: {
       provider: MEDIA_STORAGE_PROVIDER,
       mode: MEDIA_UPLOAD_MODE,
@@ -271,7 +478,7 @@ app.get('/health', withErrorHandling(async (_req, res) => {
   });
 }));
 
-app.get(['/videos', '/api/videos', '/catalog', '/api/catalog'], withErrorHandling(async (req, res) => {
+app.get(['/videos', '/api/videos', '/catalog', '/api/catalog', '/videos.json', '/catalog.json', '/index.json'], withErrorHandling(async (req, res) => {
   const filters = {
     status: normalizeString(req.query.status),
     limit: Math.max(1, Math.min(500, Math.round(coerceNumber(req.query.limit, 100)))),
@@ -304,17 +511,88 @@ app.get(['/videos/:id', '/api/videos/:id'], withErrorHandling(async (req, res) =
   res.json(await buildPublicCatalogItem(req, video));
 }));
 
+app.get('/videos/:id/subtitle-document', withErrorHandling(async (req, res) => {
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+
+  const subtitlePath = resolveExistingFile(SUBTITLE_DIR, item.subtitleDocumentFile);
+  if (subtitlePath) {
+    res.json(JSON.parse(fs.readFileSync(subtitlePath, 'utf8')));
+    return;
+  }
+
+  const published = await resolvePublishedAssetUrls(req, item);
+  maybeRedirectToExternalAsset(req, res, published.subtitleDocumentUrl);
+}));
+
+app.get('/media/:id/stream', withErrorHandling(async (req, res) => {
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+
+  const mediaPath = resolveExistingFile(MEDIA_DIR, item.mediaFile);
+  if (mediaPath) {
+    res.sendFile(mediaPath);
+    return;
+  }
+
+  const published = await resolvePublishedAssetUrls(req, item);
+  maybeRedirectToExternalAsset(req, res, published.mediaUrl || published.downloadUrl);
+}));
+
+app.get('/media/:id/download', withErrorHandling(async (req, res) => {
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+
+  const mediaPath = resolveExistingFile(MEDIA_DIR, item.mediaFile);
+  if (mediaPath) {
+    res.download(mediaPath, item.mediaFile || `${item.id}.bin`);
+    return;
+  }
+
+  const published = await resolvePublishedAssetUrls(req, item);
+  maybeRedirectToExternalAsset(req, res, published.downloadUrl || published.mediaUrl);
+}));
+
+app.get('/media/:id/thumbnail', withErrorHandling(async (req, res) => {
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+
+  const thumbnailPath = resolveExistingFile(THUMBNAIL_DIR, item.thumbnailFile);
+  if (thumbnailPath) {
+    res.sendFile(thumbnailPath);
+    return;
+  }
+
+  const published = await resolvePublishedAssetUrls(req, item);
+  maybeRedirectToExternalAsset(req, res, published.thumbnailUrl);
+}));
+
 app.get('/admin/videos', requireAdmin, withErrorHandling(async (req, res) => {
-  const items = await mediaStore.listVideos({
+  const filters = {
     status: normalizeString(req.query.status),
     limit: Math.max(1, Math.min(500, Math.round(coerceNumber(req.query.limit, 100)))),
     offset: Math.max(0, Math.round(coerceNumber(req.query.offset, 0))),
-  });
-  const result = await Promise.all(items.map((item) => buildPublicCatalogItem(req, item)));
+  };
+  const [items, total] = await Promise.all([
+    mediaStore.listVideos(filters),
+    mediaStore.countVideos({ status: filters.status }),
+  ]);
+  const result = await Promise.all(items.map((item) => buildAdminCatalogItem(req, item)));
   res.json({
     items: result,
+    total,
     service: SERVICE_NAME,
     version: VERSION,
+    storageMode: STORAGE_MODE,
+    allowLocalUploads: ALLOW_LOCAL_UPLOADS,
     mediaBackend: MEDIA_BACKEND,
   });
 }));
@@ -324,7 +602,7 @@ app.get('/admin/videos/:id', requireAdmin, withErrorHandling(async (req, res) =>
   if (!item) {
     throw createHttpError(404, 'Video not found.');
   }
-  res.json(await buildPublicCatalogItem(req, item));
+  res.json(await buildAdminCatalogItem(req, item));
 }));
 
 app.post('/admin/videos', requireAdmin, jsonParser, withErrorHandling(async (req, res) => {
@@ -336,7 +614,7 @@ app.post('/admin/videos', requireAdmin, jsonParser, withErrorHandling(async (req
     throw createHttpError(409, `Video ${next.id} already exists.`);
   }
   const created = await mediaStore.createVideo(next);
-  res.status(201).json(await buildPublicCatalogItem(req, created));
+  res.status(201).json(await buildAdminCatalogItem(req, created));
 }));
 
 app.put('/admin/videos/:id', requireAdmin, jsonParser, withErrorHandling(async (req, res) => {
@@ -352,7 +630,111 @@ app.put('/admin/videos/:id', requireAdmin, jsonParser, withErrorHandling(async (
     throw createHttpError(400, 'Changing existing video id is not supported.');
   }
   const updated = await mediaStore.updateVideo(current.id, normalized);
-  res.json(await buildPublicCatalogItem(req, updated));
+  res.json(await buildAdminCatalogItem(req, updated));
+}));
+
+app.delete('/admin/videos/:id', requireAdmin, withErrorHandling(async (req, res) => {
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+
+  const deleteFiles = coerceBoolean(req.query.deleteFiles, false);
+  await mediaStore.deleteVideo(item.id);
+
+  if (deleteFiles) {
+    [
+      resolveExistingFile(MEDIA_DIR, item.mediaFile),
+      resolveExistingFile(THUMBNAIL_DIR, item.thumbnailFile),
+      resolveExistingFile(SUBTITLE_DIR, item.subtitleDocumentFile),
+    ].filter(Boolean).forEach((filePath) => fs.unlinkSync(filePath));
+  }
+
+  res.json({ ok: true, deletedId: item.id, deletedFiles: deleteFiles });
+}));
+
+app.put('/admin/videos/:id/media', requireAdmin, rawMediaParser, withErrorHandling(async (req, res) => {
+  assertUploadsEnabled();
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+    throw createHttpError(400, '媒体文件为空。');
+  }
+
+  const uploadedTitle = extractUploadDisplayTitle(req.header('x-filename'));
+  const fileName = resolveUploadFileName(item.id, req.header('x-filename'), '.mp4');
+  const mediaPath = writeBinaryFile(MEDIA_DIR, fileName, req.body);
+  const detectedDurationSeconds = await probeMediaDurationSeconds(mediaPath);
+  const updated = await mediaStore.updateVideo(item.id, {
+    title: shouldReplaceTitleFromUpload(item, uploadedTitle) ? uploadedTitle : item.title,
+    durationSeconds: detectedDurationSeconds ?? item.durationSeconds,
+    mediaFile: fileName,
+    mediaType: inferMediaTypeFromFileName(fileName),
+    mediaUrl: '',
+    downloadUrl: '',
+    sourceAssetId: '',
+  });
+
+  res.json({
+    ok: true,
+    uploaded: fileName,
+    detectedDurationSeconds,
+    item: await buildAdminCatalogItem(req, updated),
+  });
+}));
+
+app.put('/admin/videos/:id/thumbnail', requireAdmin, rawMediaParser, withErrorHandling(async (req, res) => {
+  assertUploadsEnabled();
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+    throw createHttpError(400, '缩略图文件为空。');
+  }
+
+  const fileName = resolveUploadFileName(item.id, req.header('x-filename'), '.jpg');
+  writeBinaryFile(THUMBNAIL_DIR, fileName, req.body);
+  const updated = await mediaStore.updateVideo(item.id, {
+    thumbnailFile: fileName,
+    thumbnailUrl: '',
+    coverAssetId: '',
+  });
+  res.json({ ok: true, uploaded: fileName, item: await buildAdminCatalogItem(req, updated) });
+}));
+
+app.put('/admin/videos/:id/subtitle-document', requireAdmin, textParser, withErrorHandling(async (req, res) => {
+  assertUploadsEnabled();
+  const item = await mediaStore.getVideoById(req.params.id);
+  if (!item) {
+    throw createHttpError(404, 'Video not found.');
+  }
+  const rawText = typeof req.body === 'string' ? req.body.trim() : '';
+  if (!rawText) {
+    throw createHttpError(400, '字幕 JSON 不能为空。');
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(rawText);
+  } catch {
+    throw createHttpError(400, '字幕文件必须是合法 JSON。');
+  }
+
+  const fileName = resolveUploadFileName(item.id, req.header('x-filename'), '.json');
+  fs.writeFileSync(path.join(SUBTITLE_DIR, fileName), JSON.stringify(payload, null, 2) + '\n');
+  const summary = subtitleSummaryFromDocument(payload);
+  const updated = await mediaStore.updateVideo(item.id, {
+    subtitleDocumentFile: fileName,
+    subtitleDocumentUrl: '',
+    subtitleAssetId: '',
+    hasRefinedSubtitles: summary.hasRefinedSubtitles,
+    hasTranslation: summary.hasTranslation,
+    referenceText: summary.referenceText || item.referenceText,
+  });
+  res.json({ ok: true, uploaded: fileName, item: await buildAdminCatalogItem(req, updated) });
 }));
 
 app.post(['/upload-sessions', '/api/upload-sessions'], jsonParser, withErrorHandling(async (req, res) => {
@@ -393,7 +775,7 @@ app.post(['/upload-sessions', '/api/upload-sessions'], jsonParser, withErrorHand
       file_id: fileId || undefined,
       expires_at: expiresAt,
       confirm_url: `${getBaseUrl(req)}/upload-sessions/${encodeURIComponent(uploadSession.id)}/confirm`,
-      note: 'This baseline endpoint issues backend-controlled object keys. For COS direct upload, let client upload with short-lived credentials, then call confirm.',
+      note: 'This endpoint issues backend-controlled object keys. Upload the object, then call confirm.',
     },
   });
 }));
@@ -496,15 +878,17 @@ app.get('/internal/videos/:id/source', requireInternal, withErrorHandling(async 
   if (!video) {
     throw createHttpError(404, 'Video not found.');
   }
-  const sourceAsset = video.sourceAssetId ? await mediaStore.getMediaAssetById(video.sourceAssetId) : null;
 
+  const published = await resolvePublishedAssetUrls(req, video);
   const sourceUri =
+    published.downloadUrl ||
+    published.mediaUrl ||
     normalizeString(video.mediaUrl) ||
     normalizeString(video.downloadUrl) ||
-    normalizeString(sourceAsset?.fileId) ||
-    buildCloudFileId({ bucket: sourceAsset?.bucket || MEDIA_BUCKET, objectKey: sourceAsset?.objectKey || '' }) ||
-    buildPublicAssetUrl(sourceAsset?.objectKey || '') ||
-    normalizeString(sourceAsset?.objectKey);
+    normalizeString(published.sourceAsset?.fileId) ||
+    buildCloudFileId({ bucket: published.sourceAsset?.bucket || MEDIA_BUCKET, objectKey: published.sourceAsset?.objectKey || '' }) ||
+    buildPublicAssetUrl(published.sourceAsset?.objectKey || '') ||
+    normalizeString(published.sourceAsset?.objectKey);
 
   if (!sourceUri) {
     throw createHttpError(409, 'Video source is not ready.');
@@ -513,8 +897,8 @@ app.get('/internal/videos/:id/source', requireInternal, withErrorHandling(async 
   res.json({
     video_id: video.id,
     source_uri: sourceUri,
-    source_asset_id: sourceAsset?.id || '',
-    source_asset: sourceAsset || null,
+    source_asset_id: published.sourceAsset?.id || video.sourceAssetId || '',
+    source_asset: published.sourceAsset || null,
   });
 }));
 
@@ -525,6 +909,46 @@ app.post('/internal/videos/:id/subtitle-asset', requireInternal, jsonParser, wit
   const current = await mediaStore.getVideoById(req.params.id);
   if (!current) {
     throw createHttpError(404, 'Video not found.');
+  }
+
+  const inlineSubtitleDocument = req.body.subtitleDocument || req.body.subtitle_document;
+  if (isObject(inlineSubtitleDocument)) {
+    const fileName = resolveUploadFileName(
+      current.id,
+      normalizeString(req.body.fileName || req.body.file_name, `${current.id}.json`),
+      '.json',
+    );
+    fs.writeFileSync(
+      path.join(SUBTITLE_DIR, fileName),
+      JSON.stringify(inlineSubtitleDocument, null, 2) + '\n',
+    );
+    const summary = subtitleSummaryFromDocument(inlineSubtitleDocument);
+    const updated = await mediaStore.updateVideo(current.id, {
+      subtitleAssetId: '',
+      subtitleDocumentFile: fileName,
+      subtitleDocumentUrl: '',
+      hasRefinedSubtitles: coerceBoolean(
+        req.body.hasRefinedSubtitles ?? req.body.has_refined_subtitles,
+        summary.hasRefinedSubtitles,
+      ),
+      hasTranslation: coerceBoolean(
+        req.body.hasTranslation ?? req.body.has_translation,
+        summary.hasTranslation,
+      ),
+      referenceText: normalizeString(
+        req.body.referenceText || req.body.reference_text,
+        summary.referenceText || current.referenceText,
+      ),
+    });
+
+    res.json({
+      ok: true,
+      mode: 'inline_subtitle_document',
+      video: await buildPublicCatalogItem(req, updated),
+      subtitle_asset: null,
+      subtitle_document_file: fileName,
+    });
+    return;
   }
 
   let subtitleAsset = null;
@@ -561,6 +985,7 @@ app.post('/internal/videos/:id/subtitle-asset', requireInternal, jsonParser, wit
 
   const updated = await mediaStore.updateVideo(current.id, {
     subtitleAssetId: subtitleAsset.id,
+    subtitleDocumentFile: '',
     subtitleDocumentUrl: normalizeString(req.body.subtitleDocumentUrl || req.body.subtitle_document_url, current.subtitleDocumentUrl),
     hasRefinedSubtitles: coerceBoolean(
       req.body.hasRefinedSubtitles ?? req.body.has_refined_subtitles,
@@ -579,13 +1004,18 @@ app.post('/internal/videos/:id/subtitle-asset', requireInternal, jsonParser, wit
 
 app.use((error, _req, res, _next) => {
   const status = Number(error?.status || error?.statusCode || 500);
-  const message = error instanceof Error ? error.message : 'Internal server error.';
-  if (status >= 500) {
+  const isEntityTooLarge = error?.type === 'entity.too.large' || status === 413;
+  const message = isEntityTooLarge
+    ? `上传内容过大。当前媒体上限 ${MAX_MEDIA_UPLOAD_MB} MB，字幕上限 ${MAX_SUBTITLE_UPLOAD_MB} MB。`
+    : error instanceof Error
+      ? error.message
+      : 'Internal server error.';
+  if (status >= 500 && !isEntityTooLarge) {
     console.error(error);
   }
-  res.status(status).json({ message });
+  res.status(isEntityTooLarge ? 413 : status).json({ message });
 });
 
 app.listen(PORT, HOST, () => {
-  console.log(`[${SERVICE_NAME}] listening on http://${HOST}:${PORT} backend=${MEDIA_BACKEND}`);
+  console.log(`[${SERVICE_NAME}] listening on http://${HOST}:${PORT} backend=${MEDIA_BACKEND} storage=${STORAGE_MODE}`);
 });
