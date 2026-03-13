@@ -164,11 +164,14 @@
           <h2>目录列表</h2>
           <div id="service-status" class="status">正在加载...</div>
           <div class="row">
-            <label for="admin-token">Admin Token</label>
+            <label for="admin-token">Admin Token（仅直连 media-service 时使用）</label>
             <div class="token-grid">
-              <input id="admin-token" type="password" placeholder="如果服务配置了 ADMIN_TOKEN，请填这里" />
+              <input id="admin-token" type="password" placeholder="仅在直接打开 media-service /admin 时填写" />
               <button id="save-token-btn" class="ghost" type="button">保存</button>
               <button id="clear-token-btn" class="ghost" type="button">清空</button>
+            </div>
+            <div class="small muted">
+              通过 `cybernihongo-bff` 打开本页时，不需要也不应该填写 Admin Token；请使用上方会话登录。只有直连 `media-service` 且服务启用了 `ADMIN_TOKEN` 时，才需要在这里填写。
             </div>
           </div>
           <div class="toolbar">
@@ -727,14 +730,14 @@
           await loadConfig();
         }
         if (state.auth.available && !state.auth.authenticated && !state.adminToken) {
-          setServiceStatus('当前未登录。请先通过上方会话登录，或在直连 media-service 场景下填写 Admin Token。');
+          setServiceStatus('当前未登录。请先通过上方会话登录；只有直连 media-service 场景才需要填写 Admin Token。');
           state.items = [];
           state.filteredItems = [];
           renderList();
           return;
         }
         if (state.config.adminProtected && !state.adminToken && !state.auth.authenticated) {
-          setServiceStatus(`服务开启了管理鉴权。\n请先通过上方登录会话，或填写 Admin Token 后再刷新。\n当前存储模式：${state.config.storageMode}`);
+          setServiceStatus(`服务开启了管理鉴权。\n如果你是通过 BFF 打开的，请先登录会话；只有直连 media-service 时才需要填写 Admin Token。\n当前存储模式：${state.config.storageMode}`);
           state.items = [];
           state.filteredItems = [];
           renderList();
@@ -995,7 +998,7 @@
         state.adminToken = refs.adminToken.value.trim();
         if (state.adminToken) {
           localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, state.adminToken);
-          setServiceStatus('Admin Token 已保存到当前浏览器。请点击“刷新列表”继续。');
+          setServiceStatus('Admin Token 已保存到当前浏览器。仅直连 media-service 时会使用它；如通过 BFF 打开，请保持为空并使用会话登录。');
         } else {
           localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
           setServiceStatus('Admin Token 已清空。');

@@ -12,6 +12,10 @@ Current scope:
 
 When that admin UI is opened through `cybernihongo-bff`, the page can also call proxied `auth-service` user-management routes under `/admin/users`.
 Direct `media-service` access still keeps video/media management working, but user management will show as unavailable.
+Admin UI now has two explicit modes:
+
+- through `cybernihongo-bff /admin`: use session login, do not enter `Admin Token`
+- direct `media-service /admin`: use `Admin Token` only when `ADMIN_TOKEN` is enabled on the service
 
 This service is now the default media backend for local and split deployments. `cloud-video-service` is no longer the primary implementation.
 
