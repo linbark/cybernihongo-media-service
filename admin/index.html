@@ -42,6 +42,7 @@
       .hero { padding: 22px 24px; margin-bottom: 18px; }
       .hero h1 { margin: 0; font-size: 26px; }
       .hero p { margin: 8px 0 0; line-height: 1.6; color: var(--muted); }
+      .hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 18px; align-items: start; }
       .layout { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px; }
       .aux-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px; margin-top: 18px; }
       .panel { padding: 18px; }
@@ -110,18 +111,52 @@
         background: rgba(2, 6, 23, 0.22);
         padding: 12px;
       }
+      .auth-box {
+        border-radius: 16px;
+        border: 1px solid rgba(148, 163, 184, 0.2);
+        background: rgba(8, 17, 28, 0.72);
+        padding: 16px;
+      }
+      .auth-box h2 { margin: 0 0 10px; font-size: 15px; }
       .muted { color: var(--muted); }
       .small { font-size: 12px; }
       a { color: var(--accent); }
-      @media (max-width: 1180px) { .layout, .aux-layout { grid-template-columns: 1fr; } }
+      @media (max-width: 1180px) { .hero-grid, .layout, .aux-layout { grid-template-columns: 1fr; } }
       @media (max-width: 640px) { .grid, .toolbar, .token-grid, .user-grid { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
     <div class="page">
       <section class="hero">
-        <h1>media-service Admin</h1>
-        <p>统一管理 `CyberNihongo` 的媒体目录、上传会话、本地调试文件和精修字幕。这里现在是唯一的视频目录后台入口，不再依赖 `cloud-video-service`。</p>
+        <div class="hero-grid">
+          <div>
+            <h1>media-service Admin</h1>
+            <p>统一管理 `CyberNihongo` 的媒体目录、上传会话、本地调试文件和精修字幕。这里现在是唯一的视频目录后台入口，不再依赖 `cloud-video-service`。</p>
+          </div>
+
+          <div class="auth-box">
+            <h2>会话登录</h2>
+            <div id="auth-status" class="status">正在检查当前登录状态...</div>
+            <form id="auth-form" class="row" style="margin-top: 12px;">
+              <div>
+                <label for="auth-email">邮箱</label>
+                <input id="auth-email" type="email" placeholder="例如 admin@cybernihongo.local" />
+              </div>
+              <div>
+                <label for="auth-password">密码</label>
+                <input id="auth-password" type="password" placeholder="通过 BFF 打开时可直接登录" />
+              </div>
+              <div class="actions">
+                <button id="auth-login-btn" type="submit">登录</button>
+                <button id="auth-refresh-btn" type="button" class="ghost">刷新会话</button>
+                <button id="auth-logout-btn" type="button" class="ghost">退出登录</button>
+              </div>
+            </form>
+            <div class="small muted" style="margin-top: 10px;">
+              通过 `cybernihongo-bff` 打开 `/admin` 时，页面会使用 `auth-service` session；直接打开 `media-service` 时，这里会提示不可用，可继续使用 Admin Token 管理视频。
+            </div>
+          </div>
+        </div>
       </section>
 
       <div class="layout">
@@ -339,6 +374,11 @@
         config: null,
         adminToken: localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '',
         userAdminAvailable: false,
+        auth: {
+          available: false,
+          authenticated: false,
+          user: null,
+        },
       };
 
       const refs = {
@@ -351,6 +391,13 @@
         saveTokenBtn: document.getElementById('save-token-btn'),
         clearTokenBtn: document.getElementById('clear-token-btn'),
         adminToken: document.getElementById('admin-token'),
+        authStatus: document.getElementById('auth-status'),
+        authForm: document.getElementById('auth-form'),
+        authEmail: document.getElementById('auth-email'),
+        authPassword: document.getElementById('auth-password'),
+        authLoginBtn: document.getElementById('auth-login-btn'),
+        authRefreshBtn: document.getElementById('auth-refresh-btn'),
+        authLogoutBtn: document.getElementById('auth-logout-btn'),
         form: document.getElementById('meta-form'),
         deleteBtn: document.getElementById('delete-btn'),
         uploadMediaBtn: document.getElementById('upload-media-btn'),
@@ -394,15 +441,23 @@
 
       const setServiceStatus = (text) => { refs.serviceStatus.textContent = text; };
       const setEditorStatus = (text) => { refs.editorStatus.textContent = text; };
+      const setAuthStatus = (text) => { refs.authStatus.textContent = text; };
       const setUserStatus = (text) => { refs.userStatus.textContent = text; };
       const setUserEditorStatus = (text) => { refs.userEditorStatus.textContent = text; };
       const waitForNextPaint = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
       const selectedItem = () => state.items.find((item) => item.id === state.selectedId) || null;
+      const fallbackProtectedConfig = () => ({
+        adminProtected: true,
+        storageMode: 'protected',
+        allowLocalUploads: false,
+        maxMediaUploadMb: 0,
+        maxSubtitleUploadMb: 0,
+      });
 
       const apiFetch = async (url, options = {}) => {
         const headers = new Headers(options.headers || {});
         if (state.adminToken) headers.set('X-Admin-Token', state.adminToken);
-        return fetch(url, { ...options, headers });
+        return fetch(url, { ...options, headers, credentials: 'include' });
       };
 
       const maxUploadBytes = (kind) => {
@@ -459,6 +514,12 @@
         refs.uploadSubtitleBtn.disabled = disabled;
       };
 
+      const updateAuthButtons = () => {
+        const authenticated = Boolean(state.auth.authenticated);
+        refs.authLoginBtn.disabled = authenticated;
+        refs.authLogoutBtn.disabled = !state.auth.available || !authenticated;
+      };
+
       const updateUserButtons = () => {
         const disabled = !state.userAdminAvailable;
         refs.refreshUsersBtn.disabled = false;
@@ -477,6 +538,15 @@
         refs.userPassword.value = options.password || '';
         refs.userStatusSelect.value = options.status || 'active';
         refs.userRoles.value = options.roles || 'maintainer,user';
+      };
+
+      const applyAuthState = (nextAuth) => {
+        state.auth = {
+          available: Boolean(nextAuth.available),
+          authenticated: Boolean(nextAuth.authenticated),
+          user: nextAuth.user || null,
+        };
+        updateAuthButtons();
       };
 
       const renderList = () => {
@@ -558,15 +628,113 @@
       };
 
       const loadConfig = async () => {
-        const response = await fetch('/admin/config');
-        state.config = await response.json();
+        const response = await apiFetch('/admin/config');
+        const payload = await response.json();
+        if (response.ok) {
+          state.config = payload;
+          updateUploadButtons();
+          return;
+        }
+        if ([401, 403].includes(response.status)) {
+          state.config = fallbackProtectedConfig();
+          updateUploadButtons();
+          return;
+        }
+        throw new Error(payload.message || '配置加载失败。');
+      };
+
+      const loadAuthSession = async () => {
+        setAuthStatus('正在检查当前登录状态...');
+        const response = await apiFetch('/auth/me');
+        const payload = await response.json().catch(() => ({}));
+        if (response.status === 404) {
+          applyAuthState({ available: false, authenticated: false, user: null });
+          setAuthStatus('当前入口未挂在 BFF 登录代理上。你仍可使用 Admin Token 管理视频与媒体。');
+          return;
+        }
+        if (response.status === 401) {
+          applyAuthState({ available: true, authenticated: false, user: null });
+          setAuthStatus('当前未登录。通过 BFF 打开本页时，可直接在这里登录管理员或维护人员会话。');
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(payload.message || '会话检查失败。');
+        }
+        applyAuthState({
+          available: true,
+          authenticated: true,
+          user: payload.user || null,
+        });
+        const roles = Array.isArray(payload.user?.roles) ? payload.user.roles.join(', ') : '';
+        setAuthStatus(`当前已登录：${payload.user?.display_name || payload.user?.email || 'unknown'}\n角色：${roles || 'unknown'}`);
+      };
+
+      const submitLogin = async (event) => {
+        event.preventDefault();
+        const email = refs.authEmail.value.trim();
+        const password = refs.authPassword.value;
+        if (!email || !password) {
+          setAuthStatus('请输入邮箱和密码。');
+          return;
+        }
+        setAuthStatus('正在登录...');
+        const response = await apiFetch('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          setAuthStatus(payload.message || '登录失败。');
+          return;
+        }
+        refs.authPassword.value = '';
+        await loadAuthSession();
+        await loadItems();
+        await loadUsers();
+      };
+
+      const logoutSession = async () => {
+        if (!state.auth.available) {
+          setAuthStatus('当前入口没有会话代理，无需退出。');
+          return;
+        }
+        const response = await apiFetch('/auth/logout', { method: 'POST' });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          setAuthStatus(payload.message || '退出登录失败。');
+          return;
+        }
+        applyAuthState({ available: true, authenticated: false, user: null });
+        state.userAdminAvailable = false;
+        state.users = [];
+        state.config = fallbackProtectedConfig();
         updateUploadButtons();
+        updateUserButtons();
+        renderUsers();
+        setUserStatus('请先登录管理员会话，再刷新用户列表。');
+        setUserEditorStatus('通过 BFF 打开 `/admin` 后，这里可以创建维护人员或普通用户。');
+        setAuthStatus('已退出登录。');
+        setServiceStatus('当前未加载目录。请重新登录。');
+        state.items = [];
+        state.filteredItems = [];
+        renderList();
       };
 
       const loadItems = async () => {
         if (!state.config) await loadConfig();
-        if (state.config.adminProtected && !state.adminToken) {
-          setServiceStatus(`服务开启了管理鉴权。\n请先输入 Admin Token 后再刷新。\n当前存储模式：${state.config.storageMode}`);
+        if (state.auth.authenticated && state.config?.storageMode === 'protected') {
+          await loadConfig();
+        }
+        if (state.auth.available && !state.auth.authenticated && !state.adminToken) {
+          setServiceStatus('当前未登录。请先通过上方会话登录，或在直连 media-service 场景下填写 Admin Token。');
+          state.items = [];
+          state.filteredItems = [];
+          renderList();
+          return;
+        }
+        if (state.config.adminProtected && !state.adminToken && !state.auth.authenticated) {
+          setServiceStatus(`服务开启了管理鉴权。\n请先通过上方登录会话，或填写 Admin Token 后再刷新。\n当前存储模式：${state.config.storageMode}`);
           state.items = [];
           state.filteredItems = [];
           renderList();
@@ -588,8 +756,25 @@
       };
 
       const loadUsers = async () => {
+        if (!state.auth.available) {
+          state.userAdminAvailable = false;
+          state.users = [];
+          updateUserButtons();
+          renderUsers();
+          setUserStatus('当前入口没有 BFF 登录代理；用户管理仅在通过 BFF 打开管理台时可用。');
+          return;
+        }
+        if (!state.auth.authenticated) {
+          state.userAdminAvailable = false;
+          state.users = [];
+          updateUserButtons();
+          renderUsers();
+          setUserStatus('请先登录管理员会话，再刷新用户列表。');
+          return;
+        }
         setUserStatus('正在检查用户管理入口...');
         const response = await apiFetch('/admin/users');
+        const payload = await response.json();
         if (response.status === 404) {
           state.userAdminAvailable = false;
           state.users = [];
@@ -598,7 +783,6 @@
           setUserStatus('当前管理台未挂在 BFF 用户管理代理上；视频管理不受影响。');
           return;
         }
-        const payload = await response.json();
         if (response.status === 401) {
           state.userAdminAvailable = false;
           state.users = [];
@@ -841,6 +1025,16 @@
       refs.newBtn.addEventListener('click', createNewItem);
       refs.saveTokenBtn.addEventListener('click', saveToken);
       refs.clearTokenBtn.addEventListener('click', clearToken);
+      refs.authForm.addEventListener('submit', (event) => { submitLogin(event).catch((error) => setAuthStatus(error.message)); });
+      refs.authRefreshBtn.addEventListener('click', () => {
+        loadAuthSession()
+          .then(() => Promise.all([
+            loadItems().catch((error) => setServiceStatus(error.message)),
+            loadUsers().catch((error) => setUserStatus(error.message)),
+          ]))
+          .catch((error) => setAuthStatus(error.message));
+      });
+      refs.authLogoutBtn.addEventListener('click', () => { logoutSession().catch((error) => setAuthStatus(error.message)); });
       refs.searchInput.addEventListener('input', applySearch);
       refs.form.addEventListener('submit', (event) => { saveMetadata(event).catch((error) => setEditorStatus(error.message)); });
       refs.uploadMediaBtn.addEventListener('click', () => { uploadBinary('媒体', refs.mediaFile, 'media').catch((error) => setEditorStatus(error.message)); });
@@ -852,8 +1046,12 @@
       refs.userForm.addEventListener('submit', (event) => { createUser(event).catch((error) => setUserEditorStatus(error.message)); });
 
       createNewItem();
+      updateAuthButtons();
       updateUserButtons();
-      loadConfig()
+      Promise.all([
+        loadAuthSession().catch((error) => setAuthStatus(error.message)),
+        loadConfig().catch((error) => setServiceStatus(error.message)),
+      ])
         .then(() => Promise.all([
           loadItems().catch((error) => setServiceStatus(error.message)),
           loadUsers().catch((error) => setUserStatus(error.message)),
