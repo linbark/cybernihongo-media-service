@@ -475,6 +475,45 @@ const maybeRedirectToExternalAsset = (req, res, publishedUrl) => {
   return true;
 };
 
+const streamMediaAssetDownload = async (req, res, asset, fallbackFileName = '') => {
+  if (!asset) {
+    throw createHttpError(404, 'Media asset not found.');
+  }
+
+  if (asset.bucket && asset.objectKey && cosUploadSigner.configured) {
+    const signedDownload = await cosUploadSigner.createPresignedGet({
+      bucket: asset.bucket,
+      objectKey: asset.objectKey,
+      expiresInSec: MEDIA_DOWNLOAD_URL_TTL_SEC,
+    });
+    const upstream = await fetch(signedDownload.url);
+    if (!upstream.ok) {
+      throw createHttpError(upstream.status || 502, `Upstream asset download failed (${upstream.status}).`);
+    }
+
+    const contentType = upstream.headers.get('content-type') || asset.mimeType || 'application/octet-stream';
+    const contentLength = upstream.headers.get('content-length');
+    const downloadName = sanitizeFileName(asset.fileName || fallbackFileName || `${asset.id}.bin`) || `${asset.id}.bin`;
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+    if (!upstream.body) {
+      res.status(204).end();
+      return;
+    }
+    Readable.fromWeb(upstream.body).pipe(res);
+    return;
+  }
+
+  const publishedUrl =
+    buildPublicAssetUrl(asset.objectKey || '')
+    || normalizeString(asset.objectKey)
+    || normalizeString(asset.fileId);
+  maybeRedirectToExternalAsset(req, res, publishedUrl);
+};
+
 app.disable('x-powered-by');
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -637,34 +676,17 @@ app.get('/media/:id/download', withErrorHandling(async (req, res) => {
   }
 
   const published = await resolvePublishedAssetUrls(req, item);
-  if (published.sourceAsset?.bucket && published.sourceAsset?.objectKey && cosUploadSigner.configured) {
-    const signedDownload = await cosUploadSigner.createPresignedGet({
-      bucket: published.sourceAsset.bucket,
-      objectKey: published.sourceAsset.objectKey,
-      expiresInSec: MEDIA_DOWNLOAD_URL_TTL_SEC,
-    });
-    const upstream = await fetch(signedDownload.url);
-    if (!upstream.ok) {
-      throw createHttpError(upstream.status || 502, `Upstream asset download failed (${upstream.status}).`);
-    }
-
-    const contentType = upstream.headers.get('content-type') || published.sourceAsset.mimeType || 'application/octet-stream';
-    const contentLength = upstream.headers.get('content-length');
-    const downloadName = sanitizeFileName(published.sourceAsset.fileName || item.mediaFile || `${item.id}.bin`) || `${item.id}.bin`;
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
-    }
-    if (!upstream.body) {
-      res.status(204).end();
-      return;
-    }
-    Readable.fromWeb(upstream.body).pipe(res);
+  if (published.sourceAsset) {
+    await streamMediaAssetDownload(req, res, published.sourceAsset, item.mediaFile || `${item.id}.bin`);
     return;
   }
 
   maybeRedirectToExternalAsset(req, res, published.downloadUrl || published.mediaUrl);
+}));
+
+app.get('/internal/assets/:id/download', requireInternal, withErrorHandling(async (req, res) => {
+  const asset = await mediaStore.getMediaAssetById(req.params.id);
+  await streamMediaAssetDownload(req, res, asset, `${req.params.id}.bin`);
 }));
 
 app.get('/media/:id/thumbnail', withErrorHandling(async (req, res) => {

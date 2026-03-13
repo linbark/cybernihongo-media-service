@@ -125,6 +125,7 @@ Typical admin flow:
 ## Internal APIs
 
 - `GET /internal/videos/:id/source`
+- `GET /internal/assets/:id/download`
 - `POST /internal/videos/:id/subtitle-asset`
 
 ## Migration Bootstrap
