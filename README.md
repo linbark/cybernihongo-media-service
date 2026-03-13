@@ -10,6 +10,9 @@ Current scope:
 - provide internal source lookup and subtitle attachment APIs for `task-service` / workers
 - serve a built-in admin UI from `/admin`
 
+When that admin UI is opened through `cybernihongo-bff`, the page can also call proxied `auth-service` user-management routes under `/admin/users`.
+Direct `media-service` access still keeps video/media management working, but user management will show as unavailable.
+
 This service is now the default media backend for local and split deployments. `cloud-video-service` is no longer the primary implementation.
 
 ## Local Run

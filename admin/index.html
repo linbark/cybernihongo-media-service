@@ -43,12 +43,14 @@
       .hero h1 { margin: 0; font-size: 26px; }
       .hero p { margin: 8px 0 0; line-height: 1.6; color: var(--muted); }
       .layout { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 18px; }
+      .aux-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px; margin-top: 18px; }
       .panel { padding: 18px; }
       .panel h2 { margin: 0 0 12px; font-size: 16px; }
       .row, .grid, .toolbar, .token-grid { display: grid; gap: 12px; }
       .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 12px; }
       .token-grid { grid-template-columns: minmax(0, 1fr) 120px 92px; }
+      .user-grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
       label { display: block; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
       input, textarea, select {
         width: 100%;
@@ -111,8 +113,8 @@
       .muted { color: var(--muted); }
       .small { font-size: 12px; }
       a { color: var(--accent); }
-      @media (max-width: 1180px) { .layout { grid-template-columns: 1fr; } }
-      @media (max-width: 640px) { .grid, .toolbar, .token-grid { grid-template-columns: 1fr; } }
+      @media (max-width: 1180px) { .layout, .aux-layout { grid-template-columns: 1fr; } }
+      @media (max-width: 640px) { .grid, .toolbar, .token-grid, .user-grid { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
@@ -280,6 +282,51 @@
           </div>
         </section>
       </div>
+
+      <div class="aux-layout">
+        <section class="panel">
+          <h2>用户管理</h2>
+          <div id="user-status" class="status">正在检查用户管理入口...</div>
+          <div class="toolbar">
+            <button id="refresh-users-btn" type="button">刷新用户</button>
+            <button id="fill-user-btn" type="button" class="secondary">填充示例</button>
+          </div>
+          <div id="user-list" class="list"></div>
+        </section>
+
+        <section class="panel">
+          <h2>创建用户</h2>
+          <div id="user-editor-status" class="status">通过 BFF 打开 `/admin` 后，这里可以创建维护人员或普通用户。</div>
+          <form id="user-form" class="row">
+            <div>
+              <label for="user-email">邮箱</label>
+              <input id="user-email" type="email" placeholder="例如 maintainer@cybernihongo.local" />
+            </div>
+            <div>
+              <label for="user-display-name">显示名</label>
+              <input id="user-display-name" placeholder="例如 Video Maintainer" />
+            </div>
+            <div>
+              <label for="user-password">初始密码</label>
+              <input id="user-password" type="password" placeholder="至少用于本地联调" />
+            </div>
+            <div>
+              <label for="user-status-select">状态</label>
+              <select id="user-status-select">
+                <option value="active">active</option>
+                <option value="disabled">disabled</option>
+              </select>
+            </div>
+            <div>
+              <label for="user-roles">角色</label>
+              <input id="user-roles" placeholder="例如 maintainer,user" />
+            </div>
+            <div class="actions">
+              <button id="create-user-btn" type="submit">创建用户</button>
+            </div>
+          </form>
+        </section>
+      </div>
     </div>
 
     <script>
@@ -287,9 +334,11 @@
       const state = {
         items: [],
         filteredItems: [],
+        users: [],
         selectedId: '',
         config: null,
         adminToken: localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '',
+        userAdminAvailable: false,
       };
 
       const refs = {
@@ -327,12 +376,26 @@
         subtitleDocumentUrl: document.getElementById('subtitleDocumentUrl'),
         hasRefinedSubtitles: document.getElementById('hasRefinedSubtitles'),
         hasTranslation: document.getElementById('hasTranslation'),
+        userStatus: document.getElementById('user-status'),
+        userEditorStatus: document.getElementById('user-editor-status'),
+        refreshUsersBtn: document.getElementById('refresh-users-btn'),
+        fillUserBtn: document.getElementById('fill-user-btn'),
+        userList: document.getElementById('user-list'),
+        userForm: document.getElementById('user-form'),
+        userEmail: document.getElementById('user-email'),
+        userDisplayName: document.getElementById('user-display-name'),
+        userPassword: document.getElementById('user-password'),
+        userStatusSelect: document.getElementById('user-status-select'),
+        userRoles: document.getElementById('user-roles'),
+        createUserBtn: document.getElementById('create-user-btn'),
       };
 
       refs.adminToken.value = state.adminToken;
 
       const setServiceStatus = (text) => { refs.serviceStatus.textContent = text; };
       const setEditorStatus = (text) => { refs.editorStatus.textContent = text; };
+      const setUserStatus = (text) => { refs.userStatus.textContent = text; };
+      const setUserEditorStatus = (text) => { refs.userEditorStatus.textContent = text; };
       const waitForNextPaint = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
       const selectedItem = () => state.items.find((item) => item.id === state.selectedId) || null;
 
@@ -396,6 +459,26 @@
         refs.uploadSubtitleBtn.disabled = disabled;
       };
 
+      const updateUserButtons = () => {
+        const disabled = !state.userAdminAvailable;
+        refs.refreshUsersBtn.disabled = false;
+        refs.fillUserBtn.disabled = disabled;
+        refs.userEmail.disabled = disabled;
+        refs.userDisplayName.disabled = disabled;
+        refs.userPassword.disabled = disabled;
+        refs.userStatusSelect.disabled = disabled;
+        refs.userRoles.disabled = disabled;
+        refs.createUserBtn.disabled = disabled;
+      };
+
+      const resetUserForm = (options = {}) => {
+        refs.userEmail.value = options.email || '';
+        refs.userDisplayName.value = options.displayName || '';
+        refs.userPassword.value = options.password || '';
+        refs.userStatusSelect.value = options.status || 'active';
+        refs.userRoles.value = options.roles || 'maintainer,user';
+      };
+
       const renderList = () => {
         refs.videoList.innerHTML = '';
         if (state.filteredItems.length === 0) {
@@ -424,6 +507,32 @@
             setEditorStatus(`正在编辑 ${item.title || item.id}`);
           });
           refs.videoList.appendChild(card);
+        });
+      };
+
+      const renderUsers = () => {
+        refs.userList.innerHTML = '';
+        if (!state.userAdminAvailable) {
+          refs.userList.innerHTML = '<div class="status">当前入口未暴露 `/admin/users`。如果你是通过 BFF 打开的管理台，请先登录管理员会话后再刷新。</div>';
+          return;
+        }
+        if (state.users.length === 0) {
+          refs.userList.innerHTML = '<div class="status">当前没有可展示的用户。</div>';
+          return;
+        }
+        state.users.forEach((user) => {
+          const card = document.createElement('div');
+          card.className = 'card';
+          const roles = Array.isArray(user.roles) ? user.roles.join(', ') : '';
+          card.innerHTML = `
+            <h3>${user.display_name || user.email || user.id}</h3>
+            <div class="small muted">${user.email || user.id}</div>
+            <div class="chips">
+              <span class="chip">${user.status || 'unknown'}</span>
+              <span class="chip">${roles || 'user'}</span>
+            </div>
+          `;
+          refs.userList.appendChild(card);
         });
       };
 
@@ -476,6 +585,79 @@
           const matched = selectedItem();
           if (matched) fillForm(matched);
         }
+      };
+
+      const loadUsers = async () => {
+        setUserStatus('正在检查用户管理入口...');
+        const response = await apiFetch('/admin/users');
+        if (response.status === 404) {
+          state.userAdminAvailable = false;
+          state.users = [];
+          updateUserButtons();
+          renderUsers();
+          setUserStatus('当前管理台未挂在 BFF 用户管理代理上；视频管理不受影响。');
+          return;
+        }
+        const payload = await response.json();
+        if (response.status === 401) {
+          state.userAdminAvailable = false;
+          state.users = [];
+          updateUserButtons();
+          renderUsers();
+          setUserStatus(payload.message || '请先通过 BFF 登录管理员会话，再刷新用户列表。');
+          return;
+        }
+        if (response.status === 403) {
+          state.userAdminAvailable = false;
+          state.users = [];
+          updateUserButtons();
+          renderUsers();
+          setUserStatus(payload.message || '当前账号没有用户管理权限。');
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(payload.message || '用户列表加载失败。');
+        }
+        state.userAdminAvailable = true;
+        state.users = Array.isArray(payload.items) ? payload.items : [];
+        updateUserButtons();
+        renderUsers();
+        setUserStatus(`已加载 ${state.users.length} 个用户。仅 admin 角色可以创建新用户。`);
+      };
+
+      const createUserPayload = () => ({
+        email: refs.userEmail.value.trim(),
+        displayName: refs.userDisplayName.value.trim(),
+        password: refs.userPassword.value,
+        status: refs.userStatusSelect.value,
+        roles: refs.userRoles.value.split(/[\n,，]/).map((value) => value.trim()).filter(Boolean),
+      });
+
+      const createUser = async (event) => {
+        event.preventDefault();
+        if (!state.userAdminAvailable) {
+          setUserEditorStatus('当前入口未开放用户管理。请通过 BFF 打开 `/admin` 并使用 admin 会话登录。');
+          return;
+        }
+        const payload = createUserPayload();
+        if (!payload.email || !payload.password) {
+          setUserEditorStatus('邮箱和初始密码不能为空。');
+          return;
+        }
+        const response = await apiFetch('/admin/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          setUserEditorStatus(result.message || '用户创建失败。');
+          return;
+        }
+        await loadUsers();
+        resetUserForm({ roles: payload.roles.join(', ') || 'maintainer,user' });
+        refs.userPassword.value = '';
+        setUserEditorStatus(`已创建用户：${result.user?.email || payload.email}`);
       };
 
       const ensureSelectedId = () => {
@@ -643,6 +825,18 @@
         setServiceStatus('Admin Token 已清空。');
       };
 
+      const fillUserTemplate = () => {
+        const timestamp = Date.now().toString().slice(-6);
+        resetUserForm({
+          email: `maintainer-${timestamp}@cybernihongo.local`,
+          displayName: `Maintainer ${timestamp}`,
+          password: 'change-me-now',
+          status: 'active',
+          roles: 'maintainer,user',
+        });
+        setUserEditorStatus('已填充维护人员示例，可直接修改后创建。');
+      };
+
       refs.refreshBtn.addEventListener('click', () => { loadItems().catch((error) => setServiceStatus(error.message)); });
       refs.newBtn.addEventListener('click', createNewItem);
       refs.saveTokenBtn.addEventListener('click', saveToken);
@@ -653,9 +847,18 @@
       refs.uploadThumbnailBtn.addEventListener('click', () => { uploadBinary('缩略图', refs.thumbnailFile, 'thumbnail').catch((error) => setEditorStatus(error.message)); });
       refs.uploadSubtitleBtn.addEventListener('click', () => { uploadSubtitle().catch((error) => setEditorStatus(error.message)); });
       refs.deleteBtn.addEventListener('click', () => { deleteCurrent().catch((error) => setEditorStatus(error.message)); });
+      refs.refreshUsersBtn.addEventListener('click', () => { loadUsers().catch((error) => setUserStatus(error.message)); });
+      refs.fillUserBtn.addEventListener('click', fillUserTemplate);
+      refs.userForm.addEventListener('submit', (event) => { createUser(event).catch((error) => setUserEditorStatus(error.message)); });
 
       createNewItem();
-      loadConfig().then(() => loadItems()).catch((error) => setServiceStatus(error.message));
+      updateUserButtons();
+      loadConfig()
+        .then(() => Promise.all([
+          loadItems().catch((error) => setServiceStatus(error.message)),
+          loadUsers().catch((error) => setUserStatus(error.message)),
+        ]))
+        .catch((error) => setServiceStatus(error.message));
     </script>
   </body>
 </html>
