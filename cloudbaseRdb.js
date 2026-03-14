@@ -60,6 +60,7 @@ export const resolveCloudbaseRdbConfig = (source = {}) => {
   const videosTable = pickValue(source, 'MEDIA_CLOUDBASE_VIDEOS_TABLE') || 'videos';
   const assetsTable = pickValue(source, 'MEDIA_CLOUDBASE_ASSETS_TABLE') || 'media_assets';
   const uploadSessionsTable = pickValue(source, 'MEDIA_CLOUDBASE_UPLOAD_SESSIONS_TABLE') || 'upload_sessions';
+  const auditLogsTable = pickValue(source, 'MEDIA_CLOUDBASE_AUDIT_LOGS_TABLE') || 'audit_logs';
 
   return {
     envId,
@@ -72,6 +73,7 @@ export const resolveCloudbaseRdbConfig = (source = {}) => {
     videosTable,
     assetsTable,
     uploadSessionsTable,
+    auditLogsTable,
   };
 };
 
@@ -112,5 +114,6 @@ export const summarizeCloudbaseRdbConnection = ({
   videosTable = 'videos',
   assetsTable = 'media_assets',
   uploadSessionsTable = 'upload_sessions',
+  auditLogsTable = 'audit_logs',
 }) =>
-  `cloudbase_rdb://${envId || '(env)'}/${instance}/${database || '(database)'}?videos=${videosTable}&assets=${assetsTable}&sessions=${uploadSessionsTable}`;
+  `cloudbase_rdb://${envId || '(env)'}/${instance}/${database || '(database)'}?videos=${videosTable}&assets=${assetsTable}&sessions=${uploadSessionsTable}&audit=${auditLogsTable}`;

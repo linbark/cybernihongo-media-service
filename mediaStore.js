@@ -36,6 +36,34 @@ const normalizeNumber = (value) => {
   }
   return null;
 };
+const parseJsonValue = (value, fallback) => {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return fallback;
+    }
+  }
+  return value;
+};
+const normalizeRoleList = (value) => {
+  const parsed = parseJsonValue(value, value);
+  if (Array.isArray(parsed)) {
+    return Array.from(new Set(parsed.map((item) => normalizeString(item)).filter(Boolean)));
+  }
+  if (typeof parsed === 'string') {
+    return Array.from(new Set(parsed.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean)));
+  }
+  return [];
+};
+const normalizeJsonRecord = (value) => {
+  const parsed = parseJsonValue(value, null);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return parsed;
+  }
+  return {};
+};
 
 const summarizeConnection = ({ driver, dbFilePath = '', databaseUrl = '' }) => {
   if (driver === 'sqlite') {
@@ -244,6 +272,37 @@ const mapUploadSessionToParams = (session, now = new Date().toISOString()) => ({
   updated_at: now,
 });
 
+const mapRowToAuditLog = (row) => {
+  if (!row) return null;
+  return {
+    id: row.id || '',
+    videoId: row.video_id || '',
+    action: row.action || '',
+    actorType: row.actor_type || 'unknown',
+    actorId: row.actor_id || '',
+    actorEmail: row.actor_email || '',
+    actorDisplayName: row.actor_display_name || '',
+    actorRoles: normalizeRoleList(row.actor_roles_json),
+    summary: row.summary || '',
+    details: normalizeJsonRecord(row.details_json),
+    createdAt: row.created_at || '',
+  };
+};
+
+const mapAuditLogToParams = (entry, now = new Date().toISOString()) => ({
+  id: normalizeString(entry.id),
+  video_id: normalizeString(entry.videoId),
+  action: normalizeString(entry.action),
+  actor_type: normalizeString(entry.actorType, 'unknown'),
+  actor_id: normalizeString(entry.actorId),
+  actor_email: normalizeString(entry.actorEmail),
+  actor_display_name: normalizeString(entry.actorDisplayName),
+  actor_roles_json: JSON.stringify(normalizeRoleList(entry.actorRoles)),
+  summary: normalizeString(entry.summary),
+  details_json: JSON.stringify(normalizeJsonRecord(entry.details)),
+  created_at: normalizeString(entry.createdAt, now),
+});
+
 const toSqliteParams = (params) => ({
   ...params,
   has_refined_subtitles: params.has_refined_subtitles ? 1 : 0,
@@ -321,6 +380,20 @@ const SQLITE_DDL = `
     updated_at TEXT NOT NULL DEFAULT ''
   );
 
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    actor_type TEXT NOT NULL DEFAULT 'unknown',
+    actor_id TEXT NOT NULL DEFAULT '',
+    actor_email TEXT NOT NULL DEFAULT '',
+    actor_display_name TEXT NOT NULL DEFAULT '',
+    actor_roles_json TEXT NOT NULL DEFAULT '[]',
+    summary TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT ''
+  );
+
   CREATE INDEX IF NOT EXISTS idx_videos_updated_at ON videos(updated_at DESC);
   CREATE INDEX IF NOT EXISTS idx_videos_published_at ON videos(published_at DESC);
   CREATE INDEX IF NOT EXISTS idx_media_assets_object_key ON media_assets(bucket, object_key);
@@ -328,6 +401,8 @@ const SQLITE_DDL = `
   CREATE INDEX IF NOT EXISTS idx_upload_sessions_object_key ON upload_sessions(bucket, object_key);
   CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status);
   CREATE INDEX IF NOT EXISTS idx_upload_sessions_updated_at ON upload_sessions(updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_video_created_at ON audit_logs(video_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
 `;
 
 const createSqliteStore = async ({ dbFilePath }) => {
@@ -345,6 +420,7 @@ const createSqliteStore = async ({ dbFilePath }) => {
   const selectAssetByIdStmt = db.prepare('SELECT * FROM media_assets WHERE id = ? LIMIT 1');
   const selectAssetByObjectStmt = db.prepare('SELECT * FROM media_assets WHERE bucket = ? AND object_key = ? ORDER BY updated_at DESC LIMIT 1');
   const selectUploadSessionByIdStmt = db.prepare('SELECT * FROM upload_sessions WHERE id = ? LIMIT 1');
+  const selectAuditLogByIdStmt = db.prepare('SELECT * FROM audit_logs WHERE id = ? LIMIT 1');
 
   const insertVideoStmt = db.prepare(`
     INSERT INTO videos (
@@ -425,6 +501,15 @@ const createSqliteStore = async ({ dbFilePath }) => {
       updated_at = @updated_at
     WHERE id = @id
   `);
+  const insertAuditLogStmt = db.prepare(`
+    INSERT INTO audit_logs (
+      id, video_id, action, actor_type, actor_id, actor_email, actor_display_name,
+      actor_roles_json, summary, details_json, created_at
+    ) VALUES (
+      @id, @video_id, @action, @actor_type, @actor_id, @actor_email, @actor_display_name,
+      @actor_roles_json, @summary, @details_json, @created_at
+    )
+  `);
   const deleteVideoStmt = db.prepare('DELETE FROM videos WHERE id = ?');
 
   return {
@@ -494,6 +579,29 @@ const createSqliteStore = async ({ dbFilePath }) => {
       const { created_at, ...updateParams } = params;
       updateUploadSessionStmt.run(updateParams);
       return mapRowToUploadSession(selectUploadSessionByIdStmt.get(id));
+    },
+    async listAuditLogs({ videoId = '', limit = 100, offset = 0 } = {}) {
+      const normalizedLimit = Math.max(1, Math.min(500, Math.round(Number(limit) || 100)));
+      const normalizedOffset = Math.max(0, Math.round(Number(offset) || 0));
+      if (videoId) {
+        const stmt = db.prepare('SELECT * FROM audit_logs WHERE video_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?');
+        return stmt.all(videoId, normalizedLimit, normalizedOffset).map(mapRowToAuditLog);
+      }
+      const stmt = db.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?');
+      return stmt.all(normalizedLimit, normalizedOffset).map(mapRowToAuditLog);
+    },
+    async countAuditLogs({ videoId = '' } = {}) {
+      if (videoId) {
+        const row = db.prepare('SELECT COUNT(*) AS count FROM audit_logs WHERE video_id = ?').get(videoId);
+        return Number(row?.count || 0);
+      }
+      const row = db.prepare('SELECT COUNT(*) AS count FROM audit_logs').get();
+      return Number(row?.count || 0);
+    },
+    async createAuditLog(entry) {
+      const params = mapAuditLogToParams(entry);
+      insertAuditLogStmt.run(params);
+      return mapRowToAuditLog(selectAuditLogByIdStmt.get(params.id));
     },
     async ping() {
       db.prepare('SELECT 1 AS ok').get();
@@ -575,6 +683,21 @@ const createPostgresStore = async ({ databaseUrl }) => {
       updated_at TEXT NOT NULL DEFAULT ''
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      video_id TEXT NOT NULL DEFAULT '',
+      action TEXT NOT NULL DEFAULT '',
+      actor_type TEXT NOT NULL DEFAULT 'unknown',
+      actor_id TEXT NOT NULL DEFAULT '',
+      actor_email TEXT NOT NULL DEFAULT '',
+      actor_display_name TEXT NOT NULL DEFAULT '',
+      actor_roles_json TEXT NOT NULL DEFAULT '[]',
+      summary TEXT NOT NULL DEFAULT '',
+      details_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT ''
+    );
+  `);
   await pool.query('CREATE INDEX IF NOT EXISTS idx_videos_updated_at ON videos(updated_at DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_videos_published_at ON videos(published_at DESC)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_media_assets_object_key ON media_assets(bucket, object_key)');
@@ -582,6 +705,8 @@ const createPostgresStore = async ({ databaseUrl }) => {
   await pool.query('CREATE INDEX IF NOT EXISTS idx_upload_sessions_object_key ON upload_sessions(bucket, object_key)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status)');
   await pool.query('CREATE INDEX IF NOT EXISTS idx_upload_sessions_updated_at ON upload_sessions(updated_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_audit_logs_video_created_at ON audit_logs(video_id, created_at DESC)');
+  await pool.query('CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)');
 
   return {
     driver: 'postgres',
@@ -833,6 +958,58 @@ const createPostgresStore = async ({ databaseUrl }) => {
       );
       return this.getUploadSessionById(id);
     },
+    async listAuditLogs({ videoId = '', limit = 100, offset = 0 } = {}) {
+      const values = [];
+      const clauses = [];
+      if (videoId) {
+        values.push(videoId);
+        clauses.push(`video_id = $${values.length}`);
+      }
+      values.push(Math.max(1, Math.min(500, Math.round(Number(limit) || 100))));
+      const limitIndex = values.length;
+      values.push(Math.max(0, Math.round(Number(offset) || 0)));
+      const offsetIndex = values.length;
+      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const { rows } = await pool.query(
+        `SELECT * FROM audit_logs ${whereClause} ORDER BY created_at DESC, id DESC LIMIT $${limitIndex} OFFSET $${offsetIndex}`,
+        values,
+      );
+      return rows.map(mapRowToAuditLog);
+    },
+    async countAuditLogs({ videoId = '' } = {}) {
+      if (videoId) {
+        const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM audit_logs WHERE video_id = $1', [videoId]);
+        return Number(rows[0]?.count || 0);
+      }
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM audit_logs');
+      return Number(rows[0]?.count || 0);
+    },
+    async createAuditLog(entry) {
+      const params = mapAuditLogToParams(entry);
+      await pool.query(
+        `INSERT INTO audit_logs (
+          id, video_id, action, actor_type, actor_id, actor_email, actor_display_name,
+          actor_roles_json, summary, details_json, created_at
+        ) VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
+        )`,
+        [
+          params.id,
+          params.video_id,
+          params.action,
+          params.actor_type,
+          params.actor_id,
+          params.actor_email,
+          params.actor_display_name,
+          params.actor_roles_json,
+          params.summary,
+          params.details_json,
+          params.created_at,
+        ],
+      );
+      const { rows } = await pool.query('SELECT * FROM audit_logs WHERE id = $1 LIMIT 1', [params.id]);
+      return mapRowToAuditLog(rows[0]);
+    },
     async ping() {
       await pool.query('SELECT 1 AS ok');
       return true;
@@ -913,6 +1090,21 @@ const createMysqlStore = async ({ databaseUrl }) => {
       updated_at VARCHAR(64) NOT NULL
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id VARCHAR(191) PRIMARY KEY,
+      video_id VARCHAR(191) NOT NULL DEFAULT '',
+      action VARCHAR(191) NOT NULL DEFAULT '',
+      actor_type VARCHAR(64) NOT NULL DEFAULT 'unknown',
+      actor_id VARCHAR(191) NOT NULL DEFAULT '',
+      actor_email VARCHAR(191) NOT NULL DEFAULT '',
+      actor_display_name VARCHAR(191) NOT NULL DEFAULT '',
+      actor_roles_json LONGTEXT NOT NULL,
+      summary TEXT NOT NULL,
+      details_json LONGTEXT NOT NULL,
+      created_at VARCHAR(64) NOT NULL
+    )
+  `);
 
   const ensureIndex = async (table, name, sql) => {
     const [rows] = await pool.query(`SHOW INDEX FROM ${table} WHERE Key_name = ?`, [name]);
@@ -927,6 +1119,8 @@ const createMysqlStore = async ({ databaseUrl }) => {
   await ensureIndex('upload_sessions', 'idx_upload_sessions_object_key', 'CREATE INDEX idx_upload_sessions_object_key ON upload_sessions(bucket, object_key(255))');
   await ensureIndex('upload_sessions', 'idx_upload_sessions_status', 'CREATE INDEX idx_upload_sessions_status ON upload_sessions(status)');
   await ensureIndex('upload_sessions', 'idx_upload_sessions_updated_at', 'CREATE INDEX idx_upload_sessions_updated_at ON upload_sessions(updated_at)');
+  await ensureIndex('audit_logs', 'idx_audit_logs_video_created_at', 'CREATE INDEX idx_audit_logs_video_created_at ON audit_logs(video_id, created_at)');
+  await ensureIndex('audit_logs', 'idx_audit_logs_created_at', 'CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at)');
 
   return {
     driver: 'mysql',
@@ -1168,6 +1362,53 @@ const createMysqlStore = async ({ databaseUrl }) => {
       );
       return this.getUploadSessionById(id);
     },
+    async listAuditLogs({ videoId = '', limit = 100, offset = 0 } = {}) {
+      const values = [];
+      let where = '';
+      if (videoId) {
+        where = 'WHERE video_id = ?';
+        values.push(videoId);
+      }
+      values.push(Math.max(1, Math.min(500, Math.round(Number(limit) || 100))));
+      values.push(Math.max(0, Math.round(Number(offset) || 0)));
+      const [rows] = await pool.query(
+        `SELECT * FROM audit_logs ${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+        values,
+      );
+      return rows.map(mapRowToAuditLog);
+    },
+    async countAuditLogs({ videoId = '' } = {}) {
+      if (videoId) {
+        const [rows] = await pool.query('SELECT COUNT(*) AS count FROM audit_logs WHERE video_id = ?', [videoId]);
+        return Number(rows[0]?.count || 0);
+      }
+      const [rows] = await pool.query('SELECT COUNT(*) AS count FROM audit_logs');
+      return Number(rows[0]?.count || 0);
+    },
+    async createAuditLog(entry) {
+      const params = mapAuditLogToParams(entry);
+      await pool.query(
+        `INSERT INTO audit_logs (
+          id, video_id, action, actor_type, actor_id, actor_email, actor_display_name,
+          actor_roles_json, summary, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          params.id,
+          params.video_id,
+          params.action,
+          params.actor_type,
+          params.actor_id,
+          params.actor_email,
+          params.actor_display_name,
+          params.actor_roles_json,
+          params.summary,
+          params.details_json,
+          params.created_at,
+        ],
+      );
+      const [rows] = await pool.query('SELECT * FROM audit_logs WHERE id = ? LIMIT 1', [params.id]);
+      return mapRowToAuditLog(rows[0]);
+    },
     async ping() {
       await pool.query('SELECT 1 AS ok');
       return true;
@@ -1314,6 +1555,42 @@ const createCloudbaseRdbStore = async ({ envConfig }) => {
         `CloudBase RDB 更新上传会话 ${id} 失败`,
       );
       return this.getUploadSessionById(id);
+    },
+    async listAuditLogs({ videoId = '', limit = 100, offset = 0 } = {}) {
+      let query = tableRef(rdbConfig.auditLogsTable)
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false });
+      if (videoId) query = query.eq('video_id', videoId);
+      const result = ensureCloudbaseSuccess(
+        await query,
+        `CloudBase RDB 查询 ${rdbConfig.auditLogsTable} 失败`,
+      );
+      const rows = Array.isArray(result.data) ? result.data.map(mapRowToAuditLog) : [];
+      const normalizedOffset = Math.max(0, Math.round(Number(offset) || 0));
+      const normalizedLimit = Math.max(1, Math.min(500, Math.round(Number(limit) || 100)));
+      return rows.slice(normalizedOffset, normalizedOffset + normalizedLimit);
+    },
+    async countAuditLogs({ videoId = '' } = {}) {
+      let query = tableRef(rdbConfig.auditLogsTable).select('id', { head: true, count: 'exact' });
+      if (videoId) query = query.eq('video_id', videoId);
+      const result = ensureCloudbaseSuccess(
+        await query,
+        `CloudBase RDB 统计 ${rdbConfig.auditLogsTable} 失败`,
+      );
+      return Number(result.count || 0);
+    },
+    async createAuditLog(entry) {
+      const params = mapAuditLogToParams(entry);
+      ensureCloudbaseSuccess(
+        await tableRef(rdbConfig.auditLogsTable).insert(params),
+        `CloudBase RDB 新增审计日志 ${params.id} 失败`,
+      );
+      const result = ensureCloudbaseSuccess(
+        await tableRef(rdbConfig.auditLogsTable).select('*').eq('id', params.id).limit(1).maybeSingle(),
+        `CloudBase RDB 查询审计日志 ${params.id} 失败`,
+      );
+      return mapRowToAuditLog(result.data);
     },
     async ping() {
       await this.countVideos();

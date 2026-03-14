@@ -94,6 +94,16 @@ const ensureMysqlIndexes = async (pool) => {
     'idx_upload_sessions_updated_at',
     'CREATE INDEX idx_upload_sessions_updated_at ON upload_sessions(updated_at)',
   );
+  await safeCreate(
+    'audit_logs',
+    'idx_audit_logs_video_created_at',
+    'CREATE INDEX idx_audit_logs_video_created_at ON audit_logs(video_id, created_at)',
+  );
+  await safeCreate(
+    'audit_logs',
+    'idx_audit_logs_created_at',
+    'CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at)',
+  );
 };
 
 const runSqliteMigrations = ({ dbFilePath, migrationDir, files }) => {
@@ -229,7 +239,7 @@ const runCloudbaseRdbMigrations = ({ target, manualSqlFile }) => ({
   skipped: 0,
   target,
   manualSqlFile,
-  note: 'CloudBase RDB 模式不会自动执行 SQL 迁移，请先在 CloudBase MySQL 中创建 videos/media_assets/upload_sessions 表。',
+  note: 'CloudBase RDB 模式不会自动执行 SQL 迁移，请先在 CloudBase MySQL 中创建 videos/media_assets/upload_sessions/audit_logs 表。',
 });
 
 const printHelp = () => {
@@ -244,7 +254,8 @@ Environment fallbacks:
   MEDIA_CLOUDBASE_DATABASE
   MEDIA_CLOUDBASE_VIDEOS_TABLE
   MEDIA_CLOUDBASE_ASSETS_TABLE
-  MEDIA_CLOUDBASE_UPLOAD_SESSIONS_TABLE`);
+  MEDIA_CLOUDBASE_UPLOAD_SESSIONS_TABLE
+  MEDIA_CLOUDBASE_AUDIT_LOGS_TABLE`);
 };
 
 const main = async () => {

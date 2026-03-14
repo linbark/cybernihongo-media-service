@@ -110,6 +110,25 @@ const coerceTags = (value, fallback = []) => {
   }
   return fallback;
 };
+const coerceRoleList = (value, fallback = []) => {
+  if (Array.isArray(value)) {
+    return Array.from(new Set(value.map((item) => normalizeString(item)).filter(Boolean)));
+  }
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return fallback;
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return Array.from(new Set(parsed.map((item) => normalizeString(item)).filter(Boolean)));
+      }
+    } catch {
+      return Array.from(new Set(text.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean)));
+    }
+    return fallback;
+  }
+  return fallback;
+};
 const slugify = (value) =>
   String(value || '')
     .trim()
@@ -461,6 +480,81 @@ const buildAdminCatalogItem = async (req, item) => {
   };
 };
 
+const AUDITABLE_VIDEO_FIELDS = [
+  'title',
+  'description',
+  'provider',
+  'language',
+  'level',
+  'tags',
+  'status',
+  'durationSeconds',
+  'publishedAt',
+  'sourceAssetId',
+  'subtitleAssetId',
+  'mediaType',
+  'mediaFile',
+  'thumbnailFile',
+  'subtitleDocumentFile',
+  'mediaUrl',
+  'downloadUrl',
+  'thumbnailUrl',
+  'subtitleDocumentUrl',
+  'referenceText',
+  'hasRefinedSubtitles',
+  'hasTranslation',
+];
+
+const listChangedVideoFields = (before = {}, after = {}) =>
+  AUDITABLE_VIDEO_FIELDS.filter((field) => JSON.stringify(before?.[field] ?? null) !== JSON.stringify(after?.[field] ?? null));
+
+const getRequestActor = (req) => {
+  const actorId = normalizeString(req.header('x-auth-user-id'));
+  const actorEmail = normalizeString(req.header('x-auth-user-email'));
+  const actorDisplayName = normalizeString(req.header('x-auth-user-display-name'));
+  const actorRoles = coerceRoleList(req.header('x-auth-user-roles'));
+  if (actorId || actorEmail || actorDisplayName || actorRoles.length > 0) {
+    return {
+      actorType: 'session_user',
+      actorId,
+      actorEmail,
+      actorDisplayName,
+      actorRoles,
+    };
+  }
+
+  const adminToken = normalizeString(req.header('x-admin-token'));
+  if (adminToken && ADMIN_TOKEN && adminToken === ADMIN_TOKEN) {
+    return {
+      actorType: 'admin_token',
+      actorId: '',
+      actorEmail: '',
+      actorDisplayName: 'Direct admin token',
+      actorRoles: ['admin_token'],
+    };
+  }
+
+  return {
+    actorType: 'unknown',
+    actorId: '',
+    actorEmail: '',
+    actorDisplayName: '',
+    actorRoles: [],
+  };
+};
+
+const writeAuditLog = async (req, { action, videoId = '', summary = '', details = {} }) => {
+  await mediaStore.createAuditLog({
+    id: randomUUID(),
+    videoId,
+    action,
+    ...getRequestActor(req),
+    summary,
+    details,
+    createdAt: new Date().toISOString(),
+  });
+};
+
 const maybeRedirectToExternalAsset = (req, res, publishedUrl) => {
   if (!publishedUrl) {
     res.status(404).json({ message: 'Asset not found.' });
@@ -735,6 +829,27 @@ app.get('/admin/videos/:id', requireAdmin, withErrorHandling(async (req, res) =>
   res.json(await buildAdminCatalogItem(req, item));
 }));
 
+app.get('/admin/audit-logs', requireAdmin, withErrorHandling(async (req, res) => {
+  const filters = {
+    videoId: normalizeString(req.query.videoId || req.query.video_id),
+    limit: Math.max(1, Math.min(500, Math.round(coerceNumber(req.query.limit, 100)))),
+    offset: Math.max(0, Math.round(coerceNumber(req.query.offset, 0))),
+  };
+  const [items, total] = await Promise.all([
+    mediaStore.listAuditLogs(filters),
+    mediaStore.countAuditLogs({ videoId: filters.videoId }),
+  ]);
+  res.json({
+    items,
+    total,
+    limit: filters.limit,
+    offset: filters.offset,
+    videoId: filters.videoId || '',
+    service: SERVICE_NAME,
+    version: VERSION,
+  });
+}));
+
 app.post('/admin/videos', requireAdmin, jsonParser, withErrorHandling(async (req, res) => {
   if (!isObject(req.body)) {
     throw createHttpError(400, 'Invalid video payload.');
@@ -744,6 +859,18 @@ app.post('/admin/videos', requireAdmin, jsonParser, withErrorHandling(async (req
     throw createHttpError(409, `Video ${next.id} already exists.`);
   }
   const created = await mediaStore.createVideo(next);
+  await writeAuditLog(req, {
+    action: 'video.create',
+    videoId: created.id,
+    summary: `Created video ${created.id}`,
+    details: {
+      title: created.title,
+      provider: created.provider,
+      language: created.language,
+      mediaType: created.mediaType,
+      status: created.status,
+    },
+  });
   res.status(201).json(await buildAdminCatalogItem(req, created));
 }));
 
@@ -760,6 +887,16 @@ app.put('/admin/videos/:id', requireAdmin, jsonParser, withErrorHandling(async (
     throw createHttpError(400, 'Changing existing video id is not supported.');
   }
   const updated = await mediaStore.updateVideo(current.id, normalized);
+  await writeAuditLog(req, {
+    action: 'video.update',
+    videoId: updated.id,
+    summary: `Updated video ${updated.id}`,
+    details: {
+      changedFields: listChangedVideoFields(current, updated),
+      title: updated.title,
+      status: updated.status,
+    },
+  });
   res.json(await buildAdminCatalogItem(req, updated));
 }));
 
@@ -779,6 +916,19 @@ app.delete('/admin/videos/:id', requireAdmin, withErrorHandling(async (req, res)
       resolveExistingFile(SUBTITLE_DIR, item.subtitleDocumentFile),
     ].filter(Boolean).forEach((filePath) => fs.unlinkSync(filePath));
   }
+
+  await writeAuditLog(req, {
+    action: 'video.delete',
+    videoId: item.id,
+    summary: `Deleted video ${item.id}`,
+    details: {
+      title: item.title,
+      deleteFiles,
+      mediaFile: item.mediaFile || '',
+      thumbnailFile: item.thumbnailFile || '',
+      subtitleDocumentFile: item.subtitleDocumentFile || '',
+    },
+  });
 
   res.json({ ok: true, deletedId: item.id, deletedFiles: deleteFiles });
 }));
@@ -806,6 +956,17 @@ app.put('/admin/videos/:id/media', requireAdmin, rawMediaParser, withErrorHandli
     downloadUrl: '',
     sourceAssetId: '',
   });
+  await writeAuditLog(req, {
+    action: 'video.upload_media',
+    videoId: updated.id,
+    summary: `Uploaded media for ${updated.id}`,
+    details: {
+      fileName,
+      uploadedBytes: req.body.length,
+      mediaType: updated.mediaType,
+      detectedDurationSeconds: detectedDurationSeconds ?? null,
+    },
+  });
 
   res.json({
     ok: true,
@@ -831,6 +992,15 @@ app.put('/admin/videos/:id/thumbnail', requireAdmin, rawMediaParser, withErrorHa
     thumbnailFile: fileName,
     thumbnailUrl: '',
     coverAssetId: '',
+  });
+  await writeAuditLog(req, {
+    action: 'video.upload_thumbnail',
+    videoId: updated.id,
+    summary: `Uploaded thumbnail for ${updated.id}`,
+    details: {
+      fileName,
+      uploadedBytes: req.body.length,
+    },
   });
   res.json({ ok: true, uploaded: fileName, item: await buildAdminCatalogItem(req, updated) });
 }));
@@ -863,6 +1033,16 @@ app.put('/admin/videos/:id/subtitle-document', requireAdmin, textParser, withErr
     hasRefinedSubtitles: summary.hasRefinedSubtitles,
     hasTranslation: summary.hasTranslation,
     referenceText: summary.referenceText || item.referenceText,
+  });
+  await writeAuditLog(req, {
+    action: 'video.upload_subtitle',
+    videoId: updated.id,
+    summary: `Uploaded subtitle document for ${updated.id}`,
+    details: {
+      fileName,
+      hasRefinedSubtitles: summary.hasRefinedSubtitles,
+      hasTranslation: summary.hasTranslation,
+    },
   });
   res.json({ ok: true, uploaded: fileName, item: await buildAdminCatalogItem(req, updated) });
 }));
@@ -992,6 +1172,21 @@ app.post(['/upload-sessions/:id/confirm', '/api/upload-sessions/:id/confirm'], j
       video = await mediaStore.createVideo(normalizedVideo);
     }
   }
+
+  await writeAuditLog(req, {
+    action: 'upload_session.confirm',
+    videoId: video?.id || '',
+    summary: `Confirmed upload session ${updatedSession.id}`,
+    details: {
+      sessionId: updatedSession.id,
+      assetId: asset.id,
+      purpose: updatedSession.purpose,
+      objectKey: updatedSession.objectKey,
+      bucket: updatedSession.bucket,
+      createdVideo: Boolean(video),
+      videoId: video?.id || '',
+    },
+  });
 
   res.json({
     ok: true,

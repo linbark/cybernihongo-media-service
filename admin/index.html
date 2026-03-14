@@ -120,6 +120,7 @@
       .auth-box h2 { margin: 0 0 10px; font-size: 15px; }
       .muted { color: var(--muted); }
       .small { font-size: 12px; }
+      .mono { font-family: "SFMono-Regular", "JetBrains Mono", monospace; }
       a { color: var(--accent); }
       @media (max-width: 1180px) { .hero-grid, .layout, .aux-layout { grid-template-columns: 1fr; } }
       @media (max-width: 640px) { .grid, .toolbar, .token-grid, .user-grid { grid-template-columns: 1fr; } }
@@ -321,6 +322,23 @@
         </section>
       </div>
 
+      <section class="panel" style="margin-top: 18px;">
+        <h2>审计日志</h2>
+        <div id="audit-status" class="status">正在准备审计日志...</div>
+        <div class="grid" style="margin-top: 12px;">
+          <div>
+            <label for="audit-video-id">按视频 ID 筛选</label>
+            <input id="audit-video-id" placeholder="留空查看全部，例如 tokyo-night-walk" />
+          </div>
+          <div class="actions" style="align-items: end;">
+            <button id="refresh-audit-btn" type="button">刷新日志</button>
+            <button id="use-selected-audit-btn" type="button" class="ghost">筛选当前条目</button>
+            <button id="clear-audit-filter-btn" type="button" class="ghost">清空筛选</button>
+          </div>
+        </div>
+        <div id="audit-list" class="list" style="margin-top: 14px;"></div>
+      </section>
+
       <div class="aux-layout">
         <section class="panel">
           <h2>用户管理</h2>
@@ -372,10 +390,13 @@
       const state = {
         items: [],
         filteredItems: [],
+        auditLogs: [],
+        auditTotal: 0,
         users: [],
         selectedId: '',
         config: null,
         adminToken: localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) || '',
+        auditFilterVideoId: '',
         userAdminAvailable: false,
         auth: {
           available: false,
@@ -387,6 +408,12 @@
       const refs = {
         serviceStatus: document.getElementById('service-status'),
         editorStatus: document.getElementById('editor-status'),
+        auditStatus: document.getElementById('audit-status'),
+        auditList: document.getElementById('audit-list'),
+        auditVideoId: document.getElementById('audit-video-id'),
+        refreshAuditBtn: document.getElementById('refresh-audit-btn'),
+        useSelectedAuditBtn: document.getElementById('use-selected-audit-btn'),
+        clearAuditFilterBtn: document.getElementById('clear-audit-filter-btn'),
         videoList: document.getElementById('video-list'),
         searchInput: document.getElementById('search-input'),
         refreshBtn: document.getElementById('refresh-btn'),
@@ -444,6 +471,7 @@
 
       const setServiceStatus = (text) => { refs.serviceStatus.textContent = text; };
       const setEditorStatus = (text) => { refs.editorStatus.textContent = text; };
+      const setAuditStatus = (text) => { refs.auditStatus.textContent = text; };
       const setAuthStatus = (text) => { refs.authStatus.textContent = text; };
       const setUserStatus = (text) => { refs.userStatus.textContent = text; };
       const setUserEditorStatus = (text) => { refs.userEditorStatus.textContent = text; };
@@ -462,6 +490,12 @@
         if (state.adminToken) headers.set('X-Admin-Token', state.adminToken);
         return fetch(url, { ...options, headers, credentials: 'include' });
       };
+      const escapeHtml = (value) => String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 
       const maxUploadBytes = (kind) => {
         if (!state.config) return 0;
@@ -609,6 +643,35 @@
         });
       };
 
+      const renderAuditLogs = () => {
+        refs.auditList.innerHTML = '';
+        if (state.auditLogs.length === 0) {
+          refs.auditList.innerHTML = '<div class="status">当前没有符合条件的审计日志。</div>';
+          return;
+        }
+        state.auditLogs.forEach((entry) => {
+          const card = document.createElement('div');
+          card.className = 'card';
+          const actorLabel = entry.actorDisplayName || entry.actorEmail || entry.actorId || entry.actorType || 'unknown';
+          const roles = Array.isArray(entry.actorRoles) ? entry.actorRoles.join(', ') : '';
+          const details = entry.details && typeof entry.details === 'object'
+            ? JSON.stringify(entry.details, null, 2)
+            : '';
+          card.innerHTML = `
+            <h3>${escapeHtml(entry.summary || entry.action || 'audit log')}</h3>
+            <div class="small muted mono">${escapeHtml(entry.action || '')}</div>
+            <div class="chips">
+              <span class="chip">${escapeHtml(entry.videoId || 'global')}</span>
+              <span class="chip">${escapeHtml(actorLabel)}</span>
+              <span class="chip">${escapeHtml(roles || 'no-roles')}</span>
+              <span class="chip">${escapeHtml(entry.createdAt || '')}</span>
+            </div>
+            ${details ? `<div class="small muted mono" style="margin-top: 10px; white-space: pre-wrap;">${escapeHtml(details)}</div>` : ''}
+          `;
+          refs.auditList.appendChild(card);
+        });
+      };
+
       const applySearch = () => {
         const keyword = refs.searchInput.value.trim().toLowerCase();
         state.filteredItems = state.items.filter((item) => {
@@ -694,6 +757,7 @@
         refs.authPassword.value = '';
         await loadAuthSession();
         await loadItems();
+        await loadAuditLogs();
         await loadUsers();
       };
 
@@ -711,10 +775,14 @@
         applyAuthState({ available: true, authenticated: false, user: null });
         state.userAdminAvailable = false;
         state.users = [];
+        state.auditLogs = [];
+        state.auditTotal = 0;
         state.config = fallbackProtectedConfig();
         updateUploadButtons();
         updateUserButtons();
+        renderAuditLogs();
         renderUsers();
+        setAuditStatus('请先登录管理员或维护人员会话，再查看审计日志。');
         setUserStatus('请先登录管理员会话，再刷新用户列表。');
         setUserEditorStatus('通过 BFF 打开 `/admin` 后，这里可以创建维护人员或普通用户。');
         setAuthStatus('已退出登录。');
@@ -812,6 +880,45 @@
         setUserStatus(`已加载 ${state.users.length} 个用户。仅 admin 角色可以创建新用户。`);
       };
 
+      const loadAuditLogs = async () => {
+        if (!state.config) await loadConfig();
+        if (state.auth.authenticated && state.config?.storageMode === 'protected') {
+          await loadConfig();
+        }
+        if (state.auth.available && !state.auth.authenticated && !state.adminToken) {
+          state.auditLogs = [];
+          state.auditTotal = 0;
+          renderAuditLogs();
+          setAuditStatus('当前未登录。请先通过上方会话登录；只有直连 media-service 场景才需要填写 Admin Token。');
+          return;
+        }
+        if (state.config.adminProtected && !state.adminToken && !state.auth.authenticated) {
+          state.auditLogs = [];
+          state.auditTotal = 0;
+          renderAuditLogs();
+          setAuditStatus('当前服务开启了管理鉴权。请先登录会话，或在直连 media-service 时填写 Admin Token。');
+          return;
+        }
+        const params = new URLSearchParams();
+        const videoId = refs.auditVideoId.value.trim();
+        state.auditFilterVideoId = videoId;
+        if (videoId) params.set('videoId', videoId);
+        params.set('limit', '50');
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        setAuditStatus('正在加载审计日志...');
+        const response = await apiFetch(`/admin/audit-logs${suffix}`);
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.message || '审计日志加载失败。');
+        }
+        state.auditLogs = Array.isArray(payload.items) ? payload.items : [];
+        state.auditTotal = Number(payload.total || 0);
+        renderAuditLogs();
+        setAuditStatus(
+          `已加载 ${state.auditLogs.length} 条日志 / 总计 ${state.auditTotal} 条。${state.auditFilterVideoId ? `\n当前筛选：${state.auditFilterVideoId}` : '\n当前筛选：全部视频'}`
+        );
+      };
+
       const createUserPayload = () => ({
         email: refs.userEmail.value.trim(),
         displayName: refs.userDisplayName.value.trim(),
@@ -879,6 +986,7 @@
         }
         state.selectedId = result.id;
         await loadItems();
+        await loadAuditLogs();
         fillForm(result);
         setEditorStatus(result.public?.media_url
           ? `已保存 ${result.title}。`
@@ -919,6 +1027,7 @@
         }
         state.selectedId = result.item.id;
         await loadItems();
+        await loadAuditLogs();
         fillForm(result.item);
         input.value = '';
         const durationHint = kind === '媒体' && Number.isFinite(Number(result.detectedDurationSeconds))
@@ -962,6 +1071,7 @@
         }
         state.selectedId = result.item.id;
         await loadItems();
+        await loadAuditLogs();
         fillForm(result.item);
         refs.subtitleFile.value = '';
         setEditorStatus(`字幕上传成功：${result.uploaded}`);
@@ -991,6 +1101,7 @@
         state.selectedId = '';
         createNewItem();
         await loadItems();
+        await loadAuditLogs();
         setEditorStatus(`已删除 ${current.id}`);
       };
 
@@ -1025,6 +1136,16 @@
       };
 
       refs.refreshBtn.addEventListener('click', () => { loadItems().catch((error) => setServiceStatus(error.message)); });
+      refs.refreshAuditBtn.addEventListener('click', () => { loadAuditLogs().catch((error) => setAuditStatus(error.message)); });
+      refs.useSelectedAuditBtn.addEventListener('click', () => {
+        const current = selectedItem();
+        refs.auditVideoId.value = current?.id || refs.id.value.trim();
+        loadAuditLogs().catch((error) => setAuditStatus(error.message));
+      });
+      refs.clearAuditFilterBtn.addEventListener('click', () => {
+        refs.auditVideoId.value = '';
+        loadAuditLogs().catch((error) => setAuditStatus(error.message));
+      });
       refs.newBtn.addEventListener('click', createNewItem);
       refs.saveTokenBtn.addEventListener('click', saveToken);
       refs.clearTokenBtn.addEventListener('click', clearToken);
@@ -1033,6 +1154,7 @@
         loadAuthSession()
           .then(() => Promise.all([
             loadItems().catch((error) => setServiceStatus(error.message)),
+            loadAuditLogs().catch((error) => setAuditStatus(error.message)),
             loadUsers().catch((error) => setUserStatus(error.message)),
           ]))
           .catch((error) => setAuthStatus(error.message));
@@ -1057,6 +1179,7 @@
       ])
         .then(() => Promise.all([
           loadItems().catch((error) => setServiceStatus(error.message)),
+          loadAuditLogs().catch((error) => setAuditStatus(error.message)),
           loadUsers().catch((error) => setUserStatus(error.message)),
         ]))
         .catch((error) => setServiceStatus(error.message));
