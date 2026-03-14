@@ -12,6 +12,7 @@ import { createMediaStore } from './mediaStore.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
+app.set('trust proxy', true);
 const execFileAsync = promisify(execFile);
 
 const HOST = process.env.HOST || '0.0.0.0';
@@ -181,7 +182,19 @@ const shouldReplaceTitleFromUpload = (item, uploadedTitle) => {
   const currentId = normalizeString(item?.id);
   return !currentTitle || currentTitle === currentId;
 };
-const getBaseUrl = (req) => PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
+const getForwardedHeader = (req, name) => {
+  const value = req.get(name);
+  if (!value) return '';
+  return String(value).split(',')[0].trim();
+};
+const isLocalHost = (host) => /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/i.test(String(host || '').trim());
+const getBaseUrl = (req) => {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  const host = getForwardedHeader(req, 'x-forwarded-host') || req.get('host');
+  const protocol = getForwardedHeader(req, 'x-forwarded-proto')
+    || (isLocalHost(host) ? (req.protocol || 'http') : 'https');
+  return `${protocol}://${host}`;
+};
 const createHttpError = (status, message) => {
   const error = new Error(message);
   error.status = status;
