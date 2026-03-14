@@ -100,8 +100,12 @@ const ensureCloudbaseSuccess = (result, action) => {
 };
 
 const CLOUDBASE_RDB_BOOTSTRAP_SQL_FILE = path.resolve('migrations/mysql/001_init.sql');
+const MEDIA_CLOUDBASE_BOOTSTRAP_ENABLED = process.env.MEDIA_CLOUDBASE_BOOTSTRAP === '1';
 
 const ensureCloudbaseRdbSchema = async ({ cloudbase }) => {
+  if (!MEDIA_CLOUDBASE_BOOTSTRAP_ENABLED) {
+    return;
+  }
   const runSqlRaw = cloudbase?.models?.$runSQLRaw;
   if (typeof runSqlRaw !== 'function') {
     return;
