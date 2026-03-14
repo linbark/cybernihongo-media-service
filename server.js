@@ -20,6 +20,7 @@ const SERVICE_NAME = 'cybernihongo-media-service';
 const VERSION = 2;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.trim().replace(/\/$/, '') || '';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN?.trim() || '';
+const SESSION_PROXY_TOKEN = process.env.SESSION_PROXY_TOKEN?.trim() || '';
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN?.trim() || '';
 const MEDIA_DB_DRIVER = process.env.MEDIA_DB_DRIVER?.trim() || process.env.CATALOG_DB_DRIVER?.trim() || '';
 const MEDIA_DB_FILE = process.env.MEDIA_DB_FILE?.trim() || process.env.CATALOG_DB_FILE?.trim() || path.join(__dirname, 'data', 'media.db');
@@ -330,12 +331,23 @@ const subtitleSummaryFromDocument = (document) => {
 };
 
 const requireAdmin = (req, res, next) => {
-  if (!ADMIN_TOKEN) {
+  if (!ADMIN_TOKEN && !SESSION_PROXY_TOKEN) {
     next();
     return;
   }
   const token = req.header('x-admin-token') || String(req.query.token || '').trim();
   if (token === ADMIN_TOKEN) {
+    next();
+    return;
+  }
+  const sessionProxyToken = req.header('x-session-proxy-token') || '';
+  const hasActorContext = Boolean(
+    normalizeString(req.header('x-auth-user-id'))
+    || normalizeString(req.header('x-auth-user-email'))
+    || normalizeString(req.header('x-auth-user-display-name'))
+    || coerceRoleList(req.header('x-auth-user-roles')).length > 0
+  );
+  if (SESSION_PROXY_TOKEN && sessionProxyToken === SESSION_PROXY_TOKEN && hasActorContext) {
     next();
     return;
   }
@@ -625,7 +637,9 @@ app.get('/admin/config', withErrorHandling(async (_req, res) => {
   res.json({
     service: SERVICE_NAME,
     version: VERSION,
-    adminProtected: Boolean(ADMIN_TOKEN),
+    adminProtected: Boolean(ADMIN_TOKEN || SESSION_PROXY_TOKEN),
+    directAdminProtected: Boolean(ADMIN_TOKEN),
+    sessionProxyProtected: Boolean(SESSION_PROXY_TOKEN),
     internalProtected: Boolean(INTERNAL_TOKEN || ADMIN_TOKEN),
     storageMode: STORAGE_MODE,
     allowLocalUploads: ALLOW_LOCAL_UPLOADS,
@@ -685,7 +699,9 @@ app.get('/health', withErrorHandling(async (_req, res) => {
     videos: {
       count: videoCount,
     },
-    adminProtected: Boolean(ADMIN_TOKEN),
+    adminProtected: Boolean(ADMIN_TOKEN || SESSION_PROXY_TOKEN),
+    directAdminProtected: Boolean(ADMIN_TOKEN),
+    sessionProxyProtected: Boolean(SESSION_PROXY_TOKEN),
     internalProtected: Boolean(INTERNAL_TOKEN || ADMIN_TOKEN),
     error: healthy ? undefined : errorMessage,
     now: new Date().toISOString(),

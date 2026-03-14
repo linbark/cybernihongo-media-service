@@ -33,6 +33,7 @@ Default URLs:
 - admin config: `http://127.0.0.1:8786/admin/config`
 
 If `ADMIN_TOKEN` is set, admin APIs require `Authorization: Bearer <token>` or `X-Admin-Token`.
+When `SESSION_PROXY_TOKEN` is set, BFF may proxy session-backed admin traffic with `X-Session-Proxy-Token` plus forwarded actor headers instead of the direct admin token.
 
 ## Storage And Database
 
@@ -55,6 +56,7 @@ Reason:
 - `HOST`, default `0.0.0.0`
 - `PORT`, default `8786`
 - `ADMIN_TOKEN`, optional for admin endpoints
+- `SESSION_PROXY_TOKEN`, optional dedicated token for BFF session-backed admin proxy calls
 - `INTERNAL_TOKEN`, optional for internal endpoints
 - `MEDIA_DB_DRIVER`: `sqlite` / `postgres` / `mysql` / `cloudbase_rdb`
 - `MEDIA_DB_FILE`, SQLite path
